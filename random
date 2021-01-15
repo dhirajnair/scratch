@@ -16,3 +16,7 @@ for pod in `kubectl -n <ns> get pod -l <k>=<v> -o jsonpath='{.items[*].metadata.
   echo $pod
   kubectl top po $pod -n <ns> --containers 
 done
+
+---------------
+k8s/ check latest events in namespace, that are NOT normal
+kubectl get events --sort-by=.metadata.creationTimestamp -n <ns>|grep -v Normal
