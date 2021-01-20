@@ -20,3 +20,17 @@ done
 ---------------
 k8s/ check latest events in namespace, that are NOT normal
 kubectl get events --sort-by=.metadata.creationTimestamp -n <ns>|grep -v Normal
+
+
+---------------
+k8s/ delete instances in a instance group
+groupid=<instance-group>
+for instance in  `gcloud compute instance-groups managed list-instances $groupid --zone us-central1-f |sed 's/|/ /' | awk '{print $1}'` ; do
+  echo $instance
+  gcloud compute instance-groups managed delete-instances $groupid --instances=$instance --zone us-central1-f
+done
+
+
+---------------
+k8s/ Fetch External IP and NOde name
+kubectl get nodes -o wide|sed 's/|/ /' | awk '{print $1, $7}'
