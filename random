@@ -9,6 +9,7 @@ kubectl run --rm tools -it --image hacklab/docker-nettools bash
 k8s/ dns debuging
 https://kubernetes.io/docs/tasks/administer-cluster/dns-debugging-resolution/
 kubectl apply -f https://k8s.io/examples/admin/dns/dnsutils.yaml
+kubectl get pods --namespace=kube-system -l k8s-app=kube-dns
 
 ---------------
 k8s/ loop to find container utilization
