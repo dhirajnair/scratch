@@ -36,7 +36,9 @@ done
 k8s/ Fetch External IP and NOde name
 kubectl get nodes -o wide|sed 's/|/ /' | awk '{print $1, $7}'
 
-
+---------------
+k8s/ Create temp pod on specfic node selector
+kubectl run --rm tools -it --overrides='{"spec": { "nodeSelector": {"type": "def"}}}' --image gcr.io/marketcheck-gcp/ab-new-core-cron-util bash
 
 ---------------
 gcloud/ util image with curl and gcloud sdk
