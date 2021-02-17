@@ -55,3 +55,7 @@ gcloud/ util image with curl and gcloud sdk
  ENV PATH $PATH:/root/google-cloud-sdk/bin
  
 gcloud builds submit --tag gcr.io/marketcheck-gcp/ab-new-core-cron-util:latest
+
+---------------
+bash/ create json with prefix and suffix with id in file
+ls | cat <file> | sed 's/.*/<prefix>&<suffix>/' > new.json
