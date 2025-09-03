@@ -1,0 +1,14 @@
+# Azure AD Authentication
+GRAPH_TENANT_ID=your-tenant-id-here
+GRAPH_CLIENT_ID=your-client-id-here
+GRAPH_CLIENT_SECRET=your-client-secret-here
+
+# SharePoint Configuration
+SHAREPOINT_SITE_URL=https://yourdomain.sharepoint.com/sites/yoursite
+
+
+# Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=yourstorageaccount;AccountKey=yourkey;EndpointSuffix=core.windows.net
+AZURE_STORAGE_CONTAINER_NAME=your-container-name
+
+AZURE_STORAGE_BLOB_PATH=your/folder/path

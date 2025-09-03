@@ -1,0 +1,24 @@
+# Azure AD Authentication
+GRAPH_TENANT_ID=your-tenant-id-here
+GRAPH_CLIENT_ID=your-client-id-here
+GRAPH_CLIENT_SECRET=your-client-secret-here
+
+# SharePoint Configuration
+SHAREPOINT_SITE_URL=https://yourdomain.sharepoint.com/sites/yoursite
+SHAREPOINT_FOLDER=Shared Documents/YourFolder
+
+# Azure Storage Configuration
+AZURE_STORAGE_CONTAINER_NAME=your-container-name
+AZURE_BLOB_PREFIX=your/folder/path
+
+# File Extension Filters (optional)
+INCLUDE_EXTENSIONS=.pdf,.docx,.xlsx,.pptx
+EXCLUDE_EXTENSIONS=.tmp,.log,.bak
+
+# Folder Pattern Filters (optional) - case-insensitive pattern matching
+INCLUDE_FOLDERS=Documents,Reports,Archive,Important
+EXCLUDE_FOLDERS=temp,cache,backup,recycle,trash
+
+# Output Configuration (optional)
+OUTPUT_DIR=reconciliation_output
+GENERATE_EXCEL=true
