@@ -382,9 +382,13 @@ process_file() {
         echo "$log_prefix Progress: $completed/$TOTAL_FILES files completed" >> "$LOG_FILE"
     fi
     
-    # Get fresh download URL for this file (URLs expire quickly)
-    # Use proper URL encoding for special characters
-    local encoded_path=$(python3 -c "
+    # Check if temp file already exists (resume mode)
+    if [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
+        echo "$log_prefix RESUME: Using existing temp file for $sharepoint_path" >> "$LOG_FILE"
+    else
+        # Get fresh download URL for this file (URLs expire quickly)
+        # Use proper URL encoding for special characters
+        local encoded_path=$(python3 -c "
 import urllib.parse
 import sys
 path = sys.argv[1]
@@ -392,17 +396,17 @@ path = sys.argv[1]
 encoded = urllib.parse.quote(path, safe='/')
 print(encoded)
 " "$sharepoint_path")
-    
-    local fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-        "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
-        jq -r '."@microsoft.graph.downloadUrl" // empty')
-    
-    if [ -z "$fresh_download_url" ] || [ "$fresh_download_url" == "null" ]; then
-        echo "$log_prefix ERROR: Failed to get fresh download URL for $sharepoint_path" >> "$LOG_FILE"
-        echo "$log_prefix DEBUG: Encoded path: $encoded_path" >> "$LOG_FILE"
         
-        # Try alternative encoding for special characters
-        local alt_encoded_path=$(python3 -c "
+        local fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
+            jq -r '."@microsoft.graph.downloadUrl" // empty')
+        
+        if [ -z "$fresh_download_url" ] || [ "$fresh_download_url" == "null" ]; then
+            echo "$log_prefix ERROR: Failed to get fresh download URL for $sharepoint_path" >> "$LOG_FILE"
+            echo "$log_prefix DEBUG: Encoded path: $encoded_path" >> "$LOG_FILE"
+            
+            # Try alternative encoding for special characters
+            local alt_encoded_path=$(python3 -c "
 import urllib.parse
 import sys
 path = sys.argv[1]
@@ -410,41 +414,42 @@ path = sys.argv[1]
 encoded = urllib.parse.quote(path, safe='')
 print(encoded)
 " "$sharepoint_path")
+            
+            echo "$log_prefix DEBUG: Trying alternative encoding: $alt_encoded_path" >> "$LOG_FILE"
+            
+            # Try with alternative encoding
+            local alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
+                jq -r '."@microsoft.graph.downloadUrl" // empty')
+            
+            if [ -n "$alt_download_url" ] && [ "$alt_download_url" != "null" ]; then
+                echo "$log_prefix DEBUG: Alternative encoding worked!" >> "$LOG_FILE"
+                fresh_download_url="$alt_download_url"
+            else
+                echo "$log_prefix ERROR: Both encoding methods failed" >> "$LOG_FILE"
+                return 1
+            fi
+        fi
         
-        echo "$log_prefix DEBUG: Trying alternative encoding: $alt_encoded_path" >> "$LOG_FILE"
-        
-        # Try with alternative encoding
-        local alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
-            jq -r '."@microsoft.graph.downloadUrl" // empty')
-        
-        if [ -n "$alt_download_url" ] && [ "$alt_download_url" != "null" ]; then
-            echo "$log_prefix DEBUG: Alternative encoding worked!" >> "$LOG_FILE"
-            fresh_download_url="$alt_download_url"
-        else
-            echo "$log_prefix ERROR: Both encoding methods failed" >> "$LOG_FILE"
+        # Download file with fresh URL (optimized for speed)
+        if ! curl -L -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Accept: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,*/*" \
+            -H "User-Agent: Mozilla/5.0" \
+            --connect-timeout 30 \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 1 \
+            --compressed \
+            "$fresh_download_url" -o "$temp_file" --fail-with-body; then
+            echo "$log_prefix ERROR: Failed to download $sharepoint_path" >> "$LOG_FILE"
             return 1
         fi
-    fi
-    
-    # Download file with fresh URL (optimized for speed)
-    if ! curl -L -H "Authorization: Bearer $ACCESS_TOKEN" \
-        -H "Accept: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,*/*" \
-        -H "User-Agent: Mozilla/5.0" \
-        --connect-timeout 30 \
-        --max-time 300 \
-        --retry 3 \
-        --retry-delay 1 \
-        --compressed \
-        "$fresh_download_url" -o "$temp_file" --fail-with-body; then
-        echo "$log_prefix ERROR: Failed to download $sharepoint_path" >> "$LOG_FILE"
-        return 1
-    fi
-    
-    # Check if file was actually downloaded
-    if [ ! -f "$temp_file" ] || [ ! -s "$temp_file" ]; then
-        echo "$log_prefix ERROR: Downloaded file is empty: $sharepoint_path" >> "$LOG_FILE"
-        return 1
+        
+        # Check if file was actually downloaded
+        if [ ! -f "$temp_file" ] || [ ! -s "$temp_file" ]; then
+            echo "$log_prefix ERROR: Downloaded file is empty: $sharepoint_path" >> "$LOG_FILE"
+            return 1
+        fi
     fi
     
     # Upload to Azure (optimized for speed)
@@ -543,5 +548,11 @@ else
 fi
 
 # --- 10. Cleanup ---
-rm -rf "$TEMP_DIR"
+log "Cleaning up temporary files..."
+if [ -d "$TEMP_DIR" ]; then
+    rm -rf "$TEMP_DIR"
+    log "✅ Temp directory $TEMP_DIR removed"
+else
+    log "⚠️  Temp directory $TEMP_DIR not found (may have been cleaned up already)"
+fi
 log "Cleanup complete. Log saved to: $LOG_FILE"
