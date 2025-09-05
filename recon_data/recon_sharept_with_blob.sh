@@ -159,104 +159,118 @@ DRIVES_RESPONSE=$(curl -s --max-time 30 --connect-timeout 10 -H "Authorization: 
 DRIVE_ID=$(echo "$DRIVES_RESPONSE" | jq -r '.value[0].id')
 echo "✓ Got site and drive IDs"
 
-# Use SharePoint Search API to get ALL files recursively
-echo "Using SharePoint Search API to get all files recursively..."
+# Use optimized parallel pagination for SharePoint discovery
+echo "Using optimized parallel pagination for SharePoint discovery..."
 
-# Search for all files in the folder and subfolders with configured extensions
-# Use wildcard path to include all subfolders recursively
-SEARCH_QUERY="path:\"$SHAREPOINT_FOLDER*\" AND ($SEARCH_FILETYPES)"
-ENCODED_QUERY=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$SEARCH_QUERY'))")
-SEARCH_URL="https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root/search(q='$ENCODED_QUERY')?\$top=5000"
-
-echo "Search URL: $SEARCH_URL"
-
-> "$OUTPUT_DIR/sharepoint_files_raw.txt"
-CURRENT_URL="$SEARCH_URL"
-PAGE_NUM=1
-
-while [ -n "$CURRENT_URL" ]; do
-    echo "  Search page $PAGE_NUM..."
+# Function to process folder with parallel pagination
+get_sharepoint_files() {
+    local folder_path="$1"
+    local output_file="$2"
     
-    SEARCH_RESPONSE=$(curl -s --max-time 120 --connect-timeout 10 -H "Authorization: Bearer $ACCESS_TOKEN" "$CURRENT_URL")
+    # URL encode the folder path
+    local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$folder_path', safe='/'))")
     
-    if echo "$SEARCH_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-        echo "Search API failed, falling back to recursive folder listing..."
+    echo "  Scanning folder: $folder_path"
+    
+    # Get folder contents with pagination
+    local api_url="https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path:/children?\$top=5000"
+    
+    # Collect page URLs for parallel processing
+    local page_urls=()
+    local temp_url="$api_url"
+    local url_count=0
+    
+    echo "    Collecting page URLs..."
+    while [ -n "$temp_url" ] && [ $url_count -lt 20 ]; do  # Up to 20 pages for large folders
+        page_urls+=("$temp_url")
+        url_count=$((url_count + 1))
         
-        # Fallback to recursive folder traversal
-        traverse_folder() {
-            local folder_path="$1"
-            
-            # Check if this folder should be included
-            if ! should_include_folder "$folder_path"; then
-                echo "  Skipping excluded folder: $folder_path"
-                return
-            fi
-            
-            local url="https://graph.microsoft.com/v1.0/drives/$DRIVE_ID/root:/$folder_path:/children?\$top=5000"
-            local response=$(curl -s --max-time 60 --connect-timeout 10 -H "Authorization: Bearer $ACCESS_TOKEN" "$url")
-            
-            # Get files in current folder with full relative paths
-            echo "$response" | jq -r '.value[] | select(.folder | not) | .name' | while IFS= read -r filename; do
-                if should_include_file "$filename"; then
-                    # Calculate relative path from SharePoint folder
-                    if [ "$folder_path" = "$SHAREPOINT_FOLDER" ]; then
-                        echo "$filename" >> "$OUTPUT_DIR/sharepoint_files_raw.txt"
-                    else
-                        # Remove the SharePoint folder prefix and leading slash to get relative path
-                        relative_subfolder="${folder_path#$SHAREPOINT_FOLDER}"
-                        relative_subfolder="${relative_subfolder#/}"
-                        echo "$relative_subfolder/$filename" >> "$OUTPUT_DIR/sharepoint_files_raw.txt"
-                    fi
-                fi
-            done 2>/dev/null || true
-            
-            # Get subfolders and traverse them recursively
-            local subfolders=$(echo "$response" | jq -r '.value[] | select(.folder != null) | .name' 2>/dev/null || true)
-            while IFS= read -r subfolder; do
-                if [ -n "$subfolder" ]; then
-                    local subfolder_path="$folder_path/$subfolder"
-                    if should_include_folder "$subfolder_path"; then
-                        echo "  Traversing subfolder: $subfolder_path"
-                        traverse_folder "$subfolder_path"
-                    else
-                        echo "  Skipping excluded subfolder: $subfolder_path"
-                    fi
-                fi
-            done <<< "$subfolders"
-        }
+        # Get response to find next page
+        local response=$(curl -s --max-time 30 -H "Authorization: Bearer $ACCESS_TOKEN" "$temp_url")
         
-        traverse_folder "$SHAREPOINT_FOLDER"
-        break
-    fi
-    
-    # Extract full paths from search results
-    echo "$SEARCH_RESPONSE" | jq -r '.value[] | select(.file != null) | .webUrl' | while IFS= read -r web_url; do
-        if [ -n "$web_url" ]; then
-            # Extract relative path from webUrl
-            relative_path=$(echo "$web_url" | sed -E "s|.*/$SHAREPOINT_FOLDER/||" | sed 's|%20| |g' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-            filename=$(basename "$relative_path")
-            folder_path=$(dirname "$relative_path")
+        if echo "$response" | jq -e .value > /dev/null 2>&1; then
+            local item_count=$(echo "$response" | jq '.value | length')
+            echo "      Page $url_count: Found $item_count items"
+            temp_url=$(echo "$response" | jq -r '."@odata.nextLink" // empty')
             
-            # Check both file and folder filters
-            if should_include_file "$filename" && should_include_folder "$folder_path"; then
-                echo "$relative_path" >> "$OUTPUT_DIR/sharepoint_files_raw.txt"
+            if [ -z "$temp_url" ] || [ "$temp_url" = "null" ]; then
+                break
             fi
+        else
+            echo "      Error on page $url_count, stopping"
+            break
         fi
-    done || true
+    done
     
-    # Check for next page in search results
-    NEXT_URL=$(echo "$SEARCH_RESPONSE" | jq -r '."@odata.nextLink" // empty')
-    if [ -n "$NEXT_URL" ] && [ "$NEXT_URL" != "null" ]; then
-        CURRENT_URL="$NEXT_URL"
-        PAGE_NUM=$((PAGE_NUM + 1))
-    else
-        CURRENT_URL=""
-    fi
+    echo "    Processing ${#page_urls[@]} pages in parallel..."
     
-    # Safety limit for search
-    if [ $PAGE_NUM -gt 10 ]; then
-        echo "  Reached search page limit for safety"
-        break
+    # Process pages in parallel batches of 3
+    local batch_size=3
+    local page_index=0
+    
+    while [ $page_index -lt ${#page_urls[@]} ]; do
+        local batch_pids=()
+        
+        # Start batch of parallel requests
+        for ((i=0; i<batch_size && page_index+i<${#page_urls[@]}; i++)); do
+            local page_url="${page_urls[$((page_index + i))]}"
+            local batch_page=$((page_index + i + 1))
+            
+            (
+                local response=$(curl -s --max-time 30 -H "Authorization: Bearer $ACCESS_TOKEN" "$page_url")
+                
+                if ! echo "$response" | jq -e .error > /dev/null 2>&1; then
+                    # Process files and folders efficiently
+                    echo "$response" | jq -r '.value[]? | 
+                        if has("folder") then
+                            "FOLDER|" + .name
+                        else
+                            "FILE|" + .name
+                        end' | while IFS='|' read -r type name; do
+                        
+                        if [ "$type" = "FOLDER" ]; then
+                            # Add to folder queue for recursive processing
+                            echo "$folder_path/$name" >> "$OUTPUT_DIR/folder_queue.txt"
+                        elif [ "$type" = "FILE" ] && should_include_file "$name"; then
+                            # Calculate relative path
+                            if [ "$folder_path" = "$SHAREPOINT_FOLDER" ]; then
+                                echo "$name" >> "$output_file"
+                            else
+                                relative_subfolder="${folder_path#$SHAREPOINT_FOLDER}"
+                                relative_subfolder="${relative_subfolder#/}"
+                                echo "$relative_subfolder/$name" >> "$output_file"
+                            fi
+                        fi
+                    done
+                fi
+            ) &
+            batch_pids+=($!)
+        done
+        
+        # Wait for batch to complete
+        for pid in "${batch_pids[@]}"; do
+            wait $pid
+        done
+        
+        page_index=$((page_index + batch_size))
+        sleep 0.1  # Small delay to avoid rate limiting
+    done
+}
+
+# Initialize
+> "$OUTPUT_DIR/sharepoint_files_raw.txt"
+> "$OUTPUT_DIR/folder_queue.txt"
+echo "$SHAREPOINT_FOLDER" > "$OUTPUT_DIR/folder_queue.txt"
+
+# Process folders recursively with parallel pagination
+while [ -s "$OUTPUT_DIR/folder_queue.txt" ]; do
+    # Get next folder from queue
+    current_folder=$(head -n 1 "$OUTPUT_DIR/folder_queue.txt")
+    tail -n +2 "$OUTPUT_DIR/folder_queue.txt" > "$OUTPUT_DIR/folder_queue_temp.txt"
+    mv "$OUTPUT_DIR/folder_queue_temp.txt" "$OUTPUT_DIR/folder_queue.txt"
+    
+    if [ -n "$current_folder" ] && should_include_folder "$current_folder"; then
+        get_sharepoint_files "$current_folder" "$OUTPUT_DIR/sharepoint_files_raw.txt"
     fi
 done
 # Normalize SharePoint filenames

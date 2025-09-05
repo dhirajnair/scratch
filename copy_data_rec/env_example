@@ -1,0 +1,22 @@
+# Azure AD Authentication for Microsoft Graph API
+GRAPH_TENANT_ID=your-tenant-id-here
+GRAPH_CLIENT_ID=your-client-id-here
+GRAPH_CLIENT_SECRET=your-client-secret-here
+
+# Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=yourstorageaccount;AccountKey=yourkey;EndpointSuffix=core.windows.net
+AZURE_STORAGE_CONTAINER_NAME=raw-data
+
+# SharePoint Configuration
+SHAREPOINT_SITE_URL=https://contexq.sharepoint.com/sites/Development
+SHAREPOINT_PATH=Data/4.ESG/SNP/30-JUN-2025
+ALLOWED_EXTENSIONS=.xls,.xlsx
+
+# Optional: Maximum parallel jobs (default: 10 if not set)
+MAX_PARALLEL_JOBS=10
+
+# Optional: Parallel discovery jobs for folder scanning (default: 5 if not set)
+DISCOVERY_JOBS=5
+
+# Optional: Enable parallel pagination for large folders (default: false)
+PARALLEL_PAGINATION=true

@@ -8,6 +8,7 @@ SHAREPOINT_SITE_URL=https://yourdomain.sharepoint.com/sites/yoursite
 SHAREPOINT_FOLDER=Shared Documents/YourFolder
 
 # Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=yourstorageaccount;AccountKey=yourkey;EndpointSuffix=core.windows.net
 AZURE_STORAGE_CONTAINER_NAME=your-container-name
 AZURE_BLOB_PREFIX=your/folder/path
 
