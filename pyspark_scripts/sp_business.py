@@ -327,6 +327,8 @@ def process_excel_file(file_path):
         if df is None: 
             return False, None, f"Failed to read Excel file {file_name_on_dbfs}"
 
+        # Create displayed_values for date formatting compatibility
+        displayed_values = df.values.tolist()
         json_data = df.values.tolist()
         
         # --- CORE EXTRACTION LOGIC ---

@@ -12,6 +12,10 @@ set -e
 TEMP_DIR="temp_sharepoint_download"
 LOG_FILE="sharepoint_copy_$(date +%Y%m%d_%H%M%S).log"
 
+# Performance optimizations for large file transfers
+export PYTHONUNBUFFERED=1
+export AZURE_CORE_DISABLE_APPLICATION_INSIGHTS=1
+
 # Function to log messages
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -39,7 +43,8 @@ if [ -f .env ]; then
 fi
 
 # Set default for MAX_PARALLEL_JOBS if not provided
-MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-10}
+# Optimized for 8-core 32GB VM: 40-60 parallel jobs for 40k files
+MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-50}
 
 # Validate required environment variables
 if [ -z "$GRAPH_TENANT_ID" ] || [ -z "$GRAPH_CLIENT_ID" ] || [ -z "$GRAPH_CLIENT_SECRET" ] || [ -z "$AZURE_STORAGE_CONNECTION_STRING" ]; then
@@ -354,8 +359,27 @@ process_file() {
         echo "$log_prefix Progress: $completed/$TOTAL_FILES files completed" >> "$LOG_FILE"
     fi
     
-    # Download file
-    if ! curl -s -L -H "Authorization: Bearer $ACCESS_TOKEN" "$download_url" -o "$temp_file"; then
+    # Get fresh download URL for this file (URLs expire quickly)
+    local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$sharepoint_path', safe='/'))")
+    local fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+        "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
+        jq -r '."@microsoft.graph.downloadUrl" // empty')
+    
+    if [ -z "$fresh_download_url" ] || [ "$fresh_download_url" == "null" ]; then
+        echo "$log_prefix ERROR: Failed to get fresh download URL for $sharepoint_path" >> "$LOG_FILE"
+        return 1
+    fi
+    
+    # Download file with fresh URL (optimized for speed)
+    if ! curl -L -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Accept: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,*/*" \
+        -H "User-Agent: Mozilla/5.0" \
+        --connect-timeout 30 \
+        --max-time 300 \
+        --retry 3 \
+        --retry-delay 1 \
+        --compressed \
+        "$fresh_download_url" -o "$temp_file" --fail-with-body; then
         echo "$log_prefix ERROR: Failed to download $sharepoint_path" >> "$LOG_FILE"
         return 1
     fi
@@ -366,13 +390,14 @@ process_file() {
         return 1
     fi
     
-    # Upload to Azure
+    # Upload to Azure (optimized for speed)
     if az storage blob upload \
         --connection-string "$AZURE_STORAGE_CONNECTION_STRING" \
         --container-name "$AZURE_STORAGE_CONTAINER_NAME" \
         --name "$azure_path" \
         --file "$temp_file" \
         --overwrite \
+        --max-connections 4 \
         --output none 2>/dev/null; then
         echo "$log_prefix SUCCESS: $azure_path" >> "$LOG_FILE"
     else
