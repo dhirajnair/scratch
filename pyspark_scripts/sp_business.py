@@ -39,8 +39,10 @@ import hashlib  # For filename hashing
 import concurrent.futures # For parallel processing
 import threading          # For thread identification in logs
 import functools          # For lru_cache
+import io
 # import gc                 # For garbage collection
 from pyspark.sql import SparkSession  # For distributed processing
+from azure.storage.blob import BlobServiceClient
 
 # =============================================================================
 # CONFIGURATION SECTION - UPDATE THESE VALUES FOR YOUR ENVIRONMENT
@@ -194,6 +196,47 @@ def cleanup_temp_files(local_path, azure_temp_path=None):
         logger.warning(f"Could not remove Azure temp file {azure_temp_path}: {e}")
 
 
+def _read_excel_file(file_path: str, file_name: str):
+    """Read Excel file using Azure Blob Storage client and pandas"""
+    try:
+        logger.debug(f"Attempting to read Excel file: {file_name}")
+        
+        # Extract blob info from abfss path
+        # Format: abfss://container@account.dfs.core.windows.net/path
+        import re
+        match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+        if not match:
+            logger.error(f"Invalid abfss path format: {file_path}")
+            return None
+        
+        container_name, account_name, blob_path = match.groups()
+        
+        # Get connection string from config
+        connection_string = config["connection_string"]
+        if not connection_string:
+            logger.error("Azure connection string not found in config")
+            return None
+        
+        # Connect to blob storage
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+        
+        # Download file to memory
+        stream = io.BytesIO()
+        stream.write(blob_client.download_blob().readall())
+        stream.seek(0)
+        
+        # Read with pandas
+        pandas_df = pd.read_excel(stream, sheet_name=0)  # Read first sheet
+        
+        logger.debug(f"Successfully read Excel file: {file_name}")
+        return pandas_df
+                
+    except Exception as e:
+        logger.error(f"Error reading Excel file {file_path}: {e}")
+        return None
+
+
 @functools.lru_cache(maxsize=128)
 def detect_currency_in_header(column_name):
     """
@@ -275,88 +318,14 @@ def process_excel_file(file_path):
     The core data identification and extraction logic remains the same.
     Instead of writing to Excel files, it returns lists of rows (data + headers).
     """
-    local_tmp_file_path = None
-    azure_temp_path = None
     try:
         file_name_on_dbfs = file_path.split("/")[-1]
         
-        # Copy file to appropriate temp location and get local path for processing
-        local_tmp_file_path, azure_temp_path = copy_to_temp_and_get_local_path(file_path)
+        # Read Excel file using the new method
+        df = _read_excel_file(file_path, file_name_on_dbfs)
         
-        cell_formats = {} # Still needed if some logic relies on it, though not for formatting output here
-        displayed_values = []
-        df = None
-
-        try:
-            logger.debug(f"Attempting to read {local_tmp_file_path} as XLSX with openpyxl...")
-            book = openpyxl.load_workbook(local_tmp_file_path, data_only=True)
-            sheet = book.active
-            openpyxl_data_for_df = []
-            for row_idx, row_cells in enumerate(sheet.rows):
-                displayed_row_values = []
-                current_row_data_for_df = []
-                for col_idx, cell in enumerate(row_cells):
-                    if cell.number_format: cell_formats[(row_idx, col_idx)] = cell.number_format
-                    
-                    # Handle date values properly
-                    cell_value = cell.value
-                    if isinstance(cell_value, datetime.datetime):
-                        # Convert datetime objects to string format
-                        cell_value = cell_value.strftime("%Y-%m-%d")
-                    elif str(cell_value).startswith("java.util.GregorianCalendar"):
-                        # Extract date from GregorianCalendar string
-                        match = re.search(r'YEAR=(\d+),MONTH=(\d+),.*?DAY_OF_MONTH=(\d+)', str(cell_value))
-                        if match:
-                            year, month, day = match.groups()
-                            # Month is 0-indexed in Java Calendar, so add 1
-                            cell_value = f"{year}-{int(month)+1:02d}-{day:02d}"
-                        else:
-                            # Fallback - convert to string but strip the complex object representation
-                            cell_value = "Unknown Date Format"
-                    
-                    displayed_row_values.append(cell_value)
-                    current_row_data_for_df.append(cell_value)
-                displayed_values.append(displayed_row_values)
-                openpyxl_data_for_df.append(current_row_data_for_df)
-            df = pd.DataFrame(openpyxl_data_for_df)
-            
-            # Log sample for XLSX files to debug
-            if file_name_on_dbfs.endswith('.xlsx'):
-                logger.debug(f"XLSX file detected: {file_name_on_dbfs}")
-                # Log sample of first few rows to see data types
-                for i, row in enumerate(openpyxl_data_for_df[:3]):
-                    if i < len(openpyxl_data_for_df):
-                        logger.debug(f"Row {i}: {[type(x).__name__ for x in row[:5]]}")
-                        
-        except Exception as openpyxl_error:
-            logger.warning(f"Reading {local_tmp_file_path} as XLSX failed ({str(openpyxl_error)}). Trying XLS with xlrd...")
-            try:
-                book = xlrd.open_workbook(local_tmp_file_path, formatting_info=True)
-                sheet = book.sheet_by_index(0)
-                xlrd_data_for_df = []
-                for row_idx in range(sheet.nrows):
-                    displayed_row_values = []
-                    for col_idx in range(sheet.ncols):
-                        xf = book.xf_list[sheet.cell_xf_index(row_idx, col_idx)]
-                        format_key = xf.format_key
-                        if format_key in book.format_map:
-                            format_str = book.format_map[format_key].format_str
-                            if format_str: cell_formats[(row_idx, col_idx)] = format_str
-                        cell_obj = sheet.cell(row_idx, col_idx)
-                        cell_val = cell_obj.value; cell_typ = cell_obj.ctype
-                        if cell_typ == xlrd.XL_CELL_DATE:
-                            dt = xlrd.xldate_as_tuple(cell_val, book.datemode)
-                            displayed_row_values.append(f"{dt[0]}-{dt[1]:02d}-{dt[2]:02d}" + (f" {dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}" if dt[3:] != (0,0,0) else ""))
-                        elif cell_typ == xlrd.XL_CELL_ERROR: displayed_row_values.append(xlrd.error_text_from_code.get(cell_val, '#ERROR?'))
-                        else: displayed_row_values.append(cell_val)
-                    displayed_values.append(displayed_row_values)
-                    xlrd_data_for_df.append(sheet.row_values(row_idx))
-                df = pd.DataFrame(xlrd_data_for_df)
-            except Exception as xlrd_error:
-                err_msg = f"Failed to read {local_tmp_file_path} with both openpyxl and xlrd. openpyxl_error: {openpyxl_error}, xlrd_error: {xlrd_error}"
-                return False, None, err_msg
-        
-        if df is None: return False, None, f"DataFrame not populated for {local_tmp_file_path}."
+        if df is None: 
+            return False, None, f"Failed to read Excel file {file_name_on_dbfs}"
 
         json_data = df.values.tolist()
         
@@ -634,8 +603,6 @@ def process_excel_file(file_path):
         logger.error(error_msg)
         logger.debug(traceback.format_exc())
         return False, None, error_msg # success=False, no data, error_message
-    finally:
-        cleanup_temp_files(local_tmp_file_path, azure_temp_path)
 
 
 def process_excel_file_wrapper(file_path_arg, error_dir_arg, max_retries_arg):

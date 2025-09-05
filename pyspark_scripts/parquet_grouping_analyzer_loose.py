@@ -39,14 +39,11 @@ from typing import Dict, List, Any, Optional
 
 from pyspark.sql import SparkSession
 import pandas as pd
+from azure.storage.blob import BlobServiceClient
+import io
 
-# Try excel libs
-try:
-    import openpyxl  # noqa: F401
-    import xlrd  # noqa: F401
-    EXCEL_SUPPORT_AVAILABLE = True
-except Exception:
-    EXCEL_SUPPORT_AVAILABLE = False
+EXCEL_SUPPORT_AVAILABLE = True
+
 
 # Try to reference dbutils (Databricks). If not present, provide safe fallback.
 try:
@@ -187,49 +184,49 @@ class FileAnalyzer:
             logger.exception(f"Error reading CSV {file_path}")
             return None
 
-    # -------------------------
-    # Excel reader with fallback
-    # -------------------------
     def _read_excel_file(self, file_path: str, file_name: str):
-        """
-        Attempt spark-excel; fallback to downloading small file to driver and using pandas for a sample.
-        Note: pandas fallback reads only MAX_SAMPLE_ROWS into Spark for schema/sample purposes.
-        """
+        """Read Excel file using Azure Blob Storage client and pandas"""
         try:
-            # Try Spark Excel connector first
-            try:
-                df = self.spark.read.format("com.crealytics.spark.excel") \
-                    .option("header", "true") \
-                    .option("inferSchema", "true") \
-                    .option("dataAddress", "'Sheet1'!A1") \
-                    .option("treatEmptyValuesAsNulls", "true") \
-                    .option("usePlainNumberFormat", "true") \
-                    .load(file_path)
-                return df
-            except Exception:
-                logger.warning("spark-excel connector not available or failed; using pandas fallback for sample")
-
-            # Pandas fallback: copy small file to local driver and read nrows
-            if not EXCEL_SUPPORT_AVAILABLE:
-                logger.warning("openpyxl/xlrd not available in driver; cannot read Excel fallback")
+            logger.debug(f"Attempting to read Excel file: {file_name}")
+            
+            # Extract blob info from abfss path
+            # Format: abfss://container@account.dfs.core.windows.net/path
+            import re
+            match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+            if not match:
+                logger.error(f"Invalid abfss path format: {file_path}")
                 return None
-
-            tmp_local = f"/tmp/{uuid.uuid4().hex}_{file_name}"
-            try:
-                # dbutils.fs.cp may accept abfss paths; copy to local
-                dbutils.fs.cp(file_path, "file:" + tmp_local)
-            except Exception:
-                # If cp fails (permissions), try writing via head of file into local - but keep simple
-                logger.warning("dbutils.fs.cp failed for Excel; attempting to read via urllib/file streams is not implemented")
+            
+            container_name, account_name, blob_path = match.groups()
+            
+            # Get connection string from config
+            connection_string =  config["connection_string"]
+            if not connection_string:
+                logger.error("Azure connection string not found in config")
                 return None
-
-            pdf = pd.read_excel(tmp_local, nrows=MAX_SAMPLE_ROWS)
-            sdf = self.spark.createDataFrame(pdf)
-            return sdf
-        except Exception:
-            logger.exception(f"Error reading excel {file_path}")
+            
+            # Connect to blob storage
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+            
+            # Download file to memory
+            stream = io.BytesIO()
+            stream.write(blob_client.download_blob().readall())
+            stream.seek(0)
+            
+            # Read with pandas
+            pandas_df = pd.read_excel(stream, sheet_name=0)  # Read first sheet
+            
+            # Convert to Spark DataFrame
+            spark_df = self.spark.createDataFrame(pandas_df)
+            
+            logger.debug(f"Successfully read Excel file: {file_name}")
+            return spark_df
+                
+        except Exception as e:
+            logger.error(f"Error reading Excel file {file_path}: {e}")
             return None
-
+    
     # -------------------------
     # Schema fingerprint
     # -------------------------
