@@ -60,6 +60,15 @@ fi
 # Create temp directory
 mkdir -p "$TEMP_DIR"
 
+# Check if we're resuming from a previous run
+RESUME_MODE=false
+if [ -d "$TEMP_DIR" ] && [ "$(ls -A "$TEMP_DIR" 2>/dev/null)" ]; then
+    log "⚠️  Temp directory $TEMP_DIR already exists with files"
+    log "   This suggests a previous run was interrupted"
+    log "   Will attempt to resume by uploading existing temp files"
+    RESUME_MODE=true
+fi
+
 log "Starting recursive SharePoint to Azure copy"
 log "Site: $SHAREPOINT_SITE_URL"
 log "Path: $SHAREPOINT_PATH"
@@ -308,38 +317,52 @@ log "Drive ID: $DRIVE_ID"
 FILES_LIST="$TEMP_DIR/files_to_copy.txt"
 FOLDER_QUEUE="$TEMP_DIR/folder_queue.txt"
 
-log "Discovering files recursively..."
-
-# Process root folder first
-get_files_recursive "$DRIVE_ID" "$SHAREPOINT_PATH" "$FILES_LIST"
-
-# Process all discovered subfolders from queue
-if [ -f "$FOLDER_QUEUE" ]; then
-    while [ -s "$FOLDER_QUEUE" ]; do
-        # Get next folder from queue
-        current_folder=$(head -n 1 "$FOLDER_QUEUE")
-        tail -n +2 "$FOLDER_QUEUE" > "$TEMP_DIR/temp_queue.txt"
-        mv "$TEMP_DIR/temp_queue.txt" "$FOLDER_QUEUE"
-        
-        if [ -n "$current_folder" ]; then
-            log "Processing discovered subfolder: $current_folder"
-            get_files_recursive "$DRIVE_ID" "$current_folder" "$FILES_LIST"
-        fi
-    done
+if [ "$RESUME_MODE" = true ]; then
+    log "🔄 RESUME MODE: Skipping file discovery, using existing file list"
     
-    log "Completed processing all subfolders"
+    if [ ! -f "$FILES_LIST" ] || [ ! -s "$FILES_LIST" ]; then
+        log "ERROR: Resume mode but no existing file list found"
+        log "   Please delete $TEMP_DIR and restart"
+        exit 1
+    fi
+    
+    TOTAL_FILES=$(wc -l < "$FILES_LIST")
+    log "Found $TOTAL_FILES files from previous run"
+    log "Files will be copied to Azure container: $AZURE_STORAGE_CONTAINER_NAME"
 else
-    log "No subfolder queue found - only root folder processed"
-fi
+    log "Discovering files recursively..."
 
-if [ ! -f "$FILES_LIST" ] || [ ! -s "$FILES_LIST" ]; then
-    log "ERROR: No files found or failed to create file list"
-    exit 1
-fi
+    # Process root folder first
+    get_files_recursive "$DRIVE_ID" "$SHAREPOINT_PATH" "$FILES_LIST"
 
-TOTAL_FILES=$(wc -l < "$FILES_LIST")
-log "Found $TOTAL_FILES files to copy"
-log "Files will be copied to Azure container: $AZURE_STORAGE_CONTAINER_NAME"
+    # Process all discovered subfolders from queue
+    if [ -f "$FOLDER_QUEUE" ]; then
+        while [ -s "$FOLDER_QUEUE" ]; do
+            # Get next folder from queue
+            current_folder=$(head -n 1 "$FOLDER_QUEUE")
+            tail -n +2 "$FOLDER_QUEUE" > "$TEMP_DIR/temp_queue.txt"
+            mv "$TEMP_DIR/temp_queue.txt" "$FOLDER_QUEUE"
+            
+            if [ -n "$current_folder" ]; then
+                log "Processing discovered subfolder: $current_folder"
+                get_files_recursive "$DRIVE_ID" "$current_folder" "$FILES_LIST"
+            fi
+        done
+        
+        log "Completed processing all subfolders"
+    else
+        log "No subfolder queue found - only root folder processed"
+    fi
+
+    if [ ! -f "$FILES_LIST" ] || [ ! -s "$FILES_LIST" ]; then
+        log "ERROR: No files found or failed to create file list"
+        exit 1
+    fi
+
+    TOTAL_FILES=$(wc -l < "$FILES_LIST")
+    log "Found $TOTAL_FILES files to copy"
+    log "Files will be copied to Azure container: $AZURE_STORAGE_CONTAINER_NAME"
+fi
 
 # --- 7. Function to download and upload a single file ---
 process_file() {
@@ -360,14 +383,48 @@ process_file() {
     fi
     
     # Get fresh download URL for this file (URLs expire quickly)
-    local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$sharepoint_path', safe='/'))")
+    # Use proper URL encoding for special characters
+    local encoded_path=$(python3 -c "
+import urllib.parse
+import sys
+path = sys.argv[1]
+# Encode the path properly, preserving forward slashes
+encoded = urllib.parse.quote(path, safe='/')
+print(encoded)
+" "$sharepoint_path")
+    
     local fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
         "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
         jq -r '."@microsoft.graph.downloadUrl" // empty')
     
     if [ -z "$fresh_download_url" ] || [ "$fresh_download_url" == "null" ]; then
         echo "$log_prefix ERROR: Failed to get fresh download URL for $sharepoint_path" >> "$LOG_FILE"
-        return 1
+        echo "$log_prefix DEBUG: Encoded path: $encoded_path" >> "$LOG_FILE"
+        
+        # Try alternative encoding for special characters
+        local alt_encoded_path=$(python3 -c "
+import urllib.parse
+import sys
+path = sys.argv[1]
+# More aggressive encoding for problematic characters
+encoded = urllib.parse.quote(path, safe='')
+print(encoded)
+" "$sharepoint_path")
+        
+        echo "$log_prefix DEBUG: Trying alternative encoding: $alt_encoded_path" >> "$LOG_FILE"
+        
+        # Try with alternative encoding
+        local alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
+            jq -r '."@microsoft.graph.downloadUrl" // empty')
+        
+        if [ -n "$alt_download_url" ] && [ "$alt_download_url" != "null" ]; then
+            echo "$log_prefix DEBUG: Alternative encoding worked!" >> "$LOG_FILE"
+            fresh_download_url="$alt_download_url"
+        else
+            echo "$log_prefix ERROR: Both encoding methods failed" >> "$LOG_FILE"
+            return 1
+        fi
     fi
     
     # Download file with fresh URL (optimized for speed)
