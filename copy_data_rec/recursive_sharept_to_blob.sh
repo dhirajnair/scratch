@@ -564,15 +564,29 @@ fi
 # --- 9. Summary ---
 log "Processing completed! Generating summary..."
 
-SUCCESSFUL=$(grep -c "SUCCESS:" "$LOG_FILE" 2>/dev/null || echo "0")
-SKIPPED=$(grep -c "SKIP:" "$LOG_FILE" 2>/dev/null || echo "0")
-FAILED=$(grep -c "ERROR:" "$LOG_FILE" 2>/dev/null || echo "0")
-DOWNLOAD_ERRORS=$(grep -c "Failed to download" "$LOG_FILE" 2>/dev/null || echo "0")
-UPLOAD_ERRORS=$(grep -c "Failed to upload" "$LOG_FILE" 2>/dev/null || echo "0")
+# Safely count entries with error handling
+SUCCESSFUL=0
+SKIPPED=0
+FAILED=0
+DOWNLOAD_ERRORS=0
+UPLOAD_ERRORS=0
 
-# Calculate completion percentage
+# Count with error handling to prevent script exit
+if [ -f "$LOG_FILE" ]; then
+    SUCCESSFUL=$(grep -c "SUCCESS:" "$LOG_FILE" 2>/dev/null || echo "0")
+    SKIPPED=$(grep -c "SKIP:" "$LOG_FILE" 2>/dev/null || echo "0")
+    FAILED=$(grep -c "ERROR:" "$LOG_FILE" 2>/dev/null || echo "0")
+    DOWNLOAD_ERRORS=$(grep -c "Failed to download" "$LOG_FILE" 2>/dev/null || echo "0")
+    UPLOAD_ERRORS=$(grep -c "Failed to upload" "$LOG_FILE" 2>/dev/null || echo "0")
+fi
+
+# Calculate completion percentage with safe division
 PROCESSED=$((SUCCESSFUL + SKIPPED))
-COMPLETION_PERCENT=$((PROCESSED * 100 / (TOTAL_FILES > 0 ? TOTAL_FILES : 1)))
+if [ "$TOTAL_FILES" -gt 0 ]; then
+    COMPLETION_PERCENT=$((PROCESSED * 100 / TOTAL_FILES))
+else
+    COMPLETION_PERCENT=0
+fi
 
 log "==================== COPY OPERATION SUMMARY ===================="
 log "Total files discovered: $TOTAL_FILES"
@@ -589,12 +603,16 @@ log "Log file: $LOG_FILE"
 if [ $FAILED -gt 0 ]; then
     log "============== ERROR DETAILS =============="
     log "Recent errors from log:"
-    tail -20 "$LOG_FILE" | grep "ERROR:" | head -5 | while read -r line; do
-        log "  $line"
-    done
+    if [ -f "$LOG_FILE" ]; then
+        tail -20 "$LOG_FILE" 2>/dev/null | grep "ERROR:" 2>/dev/null | head -5 | while read -r line; do
+            log "  $line"
+        done || log "  No error details available"
+    else
+        log "  Log file not found"
+    fi
     log "Check full log file for complete error details: $LOG_FILE"
     log "============================================="
-    exit 1
+    log "⚠️  Script completed with $FAILED errors"
 else
     log "🎉 All files copied successfully!"
 fi
