@@ -17,20 +17,47 @@ if [ ! -f "$PID_FILE" ]; then
     # Look for running script processes
     PIDS=$(pgrep -f "$SCRIPT_NAME" || true)
     
-    if [ -z "$PIDS" ]; then
+    # Also look for parallel processes
+    PARALLEL_PIDS=$(pgrep -f "parallel" || true)
+    
+    if [ -z "$PIDS" ] && [ -z "$PARALLEL_PIDS" ]; then
         echo "✅ No running copy processes found"
         exit 0
     else
-        echo "🔍 Found running processes: $PIDS"
-        echo "   Killing processes..."
-        echo "$PIDS" | xargs kill -TERM 2>/dev/null || true
-        sleep 2
+        echo "🔍 Found running processes:"
+        if [ -n "$PIDS" ]; then
+            echo "   Script processes: $PIDS"
+        fi
+        if [ -n "$PARALLEL_PIDS" ]; then
+            echo "   Parallel processes: $PARALLEL_PIDS"
+        fi
+        
+        echo "   Killing all processes..."
+        
+        # Kill script processes
+        if [ -n "$PIDS" ]; then
+            echo "$PIDS" | xargs kill -TERM 2>/dev/null || true
+        fi
+        
+        # Kill parallel processes
+        if [ -n "$PARALLEL_PIDS" ]; then
+            echo "$PARALLEL_PIDS" | xargs kill -TERM 2>/dev/null || true
+        fi
+        
+        sleep 3
         
         # Force kill if still running
-        REMAINING=$(pgrep -f "$SCRIPT_NAME" || true)
-        if [ -n "$REMAINING" ]; then
-            echo "⚠️  Processes still running, force killing..."
-            echo "$REMAINING" | xargs kill -KILL 2>/dev/null || true
+        REMAINING_SCRIPT=$(pgrep -f "$SCRIPT_NAME" || true)
+        REMAINING_PARALLEL=$(pgrep -f "parallel" || true)
+        
+        if [ -n "$REMAINING_SCRIPT" ] || [ -n "$REMAINING_PARALLEL" ]; then
+            echo "⚠️  Some processes still running, force killing..."
+            if [ -n "$REMAINING_SCRIPT" ]; then
+                echo "$REMAINING_SCRIPT" | xargs kill -KILL 2>/dev/null || true
+            fi
+            if [ -n "$REMAINING_PARALLEL" ]; then
+                echo "$REMAINING_PARALLEL" | xargs kill -KILL 2>/dev/null || true
+            fi
         fi
         
         echo "✅ All processes stopped"
@@ -72,7 +99,15 @@ echo ""
 if ps -p "$PID" > /dev/null 2>&1; then
     echo "⚠️  Process still running, force killing..."
     kill -KILL "$PID" 2>/dev/null || true
-    sleep 1
+    
+    # Also kill any parallel processes that might be related
+    PARALLEL_PIDS=$(pgrep -f "parallel" || true)
+    if [ -n "$PARALLEL_PIDS" ]; then
+        echo "   Also killing parallel processes: $PARALLEL_PIDS"
+        echo "$PARALLEL_PIDS" | xargs kill -KILL 2>/dev/null || true
+    fi
+    
+    sleep 2
     
     if ps -p "$PID" > /dev/null 2>&1; then
         echo "❌ Failed to stop process $PID"

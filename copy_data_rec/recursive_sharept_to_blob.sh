@@ -11,6 +11,7 @@ set -e
 # Default values
 TEMP_DIR="temp_sharepoint_download"
 LOG_FILE="sharepoint_copy_$(date +%Y%m%d_%H%M%S).log"
+SUCCESS_FILE="successfully_uploaded.txt"
 
 # Performance optimizations for large file transfers
 export PYTHONUNBUFFERED=1
@@ -20,6 +21,7 @@ export AZURE_CORE_DISABLE_APPLICATION_INSIGHTS=1
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
+
 
 # Function to show usage
 usage() {
@@ -43,8 +45,8 @@ if [ -f .env ]; then
 fi
 
 # Set default for MAX_PARALLEL_JOBS if not provided
-# Optimized for 8-core 32GB VM: 40-60 parallel jobs for 40k files
-MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-50}
+# Conservative setting to avoid SharePoint API rate limits
+MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-20}
 
 # Validate required environment variables
 if [ -z "$GRAPH_TENANT_ID" ] || [ -z "$GRAPH_CLIENT_ID" ] || [ -z "$GRAPH_CLIENT_SECRET" ] || [ -z "$AZURE_STORAGE_CONNECTION_STRING" ]; then
@@ -369,6 +371,7 @@ process_file() {
     local file_info="$1"
     local job_id="$2"
     
+    
     IFS='|' read -r sharepoint_path download_url azure_path <<< "$file_info"
     
     local temp_file="$TEMP_DIR/job_${job_id}_$(basename "$azure_path")"
@@ -376,10 +379,17 @@ process_file() {
     
     echo "$log_prefix Processing: $sharepoint_path -> $azure_path" >> "$LOG_FILE"
     
+    # Check if file was already successfully uploaded
+    if [ -f "$SUCCESS_FILE" ] && grep -Fxq "$azure_path" "$SUCCESS_FILE" 2>/dev/null; then
+        echo "$log_prefix SKIP: File already uploaded successfully" >> "$LOG_FILE"
+        return 0
+    fi
+    
     # Progress indicator every 100 files
     if [ $((job_id % 100)) -eq 0 ]; then
         local completed=$(grep -c "SUCCESS:" "$LOG_FILE" 2>/dev/null || echo "0")
-        echo "$log_prefix Progress: $completed/$TOTAL_FILES files completed" >> "$LOG_FILE"
+        local skipped=$(grep -c "SKIP:" "$LOG_FILE" 2>/dev/null || echo "0")
+        echo "$log_prefix Progress: $completed/$TOTAL_FILES files completed, $skipped skipped" >> "$LOG_FILE"
     fi
     
     # Check if temp file already exists (resume mode)
@@ -397,9 +407,28 @@ encoded = urllib.parse.quote(path, safe='/')
 print(encoded)
 " "$sharepoint_path")
         
-        local fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
-            jq -r '."@microsoft.graph.downloadUrl" // empty')
+        # Add rate limiting and retry logic for API calls
+        local fresh_download_url=""
+        local retry_count=0
+        local max_retries=3
+        
+        while [ $retry_count -lt $max_retries ]; do
+            # Add small delay to avoid rate limiting
+            if [ $retry_count -gt 0 ]; then
+                sleep $((retry_count * 2))
+            fi
+            
+            fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
+                jq -r '."@microsoft.graph.downloadUrl" // empty')
+            
+            if [ -n "$fresh_download_url" ] && [ "$fresh_download_url" != "null" ]; then
+                break
+            fi
+            
+            retry_count=$((retry_count + 1))
+            echo "$log_prefix DEBUG: API call attempt $retry_count failed, retrying..." >> "$LOG_FILE"
+        done
         
         if [ -z "$fresh_download_url" ] || [ "$fresh_download_url" == "null" ]; then
             echo "$log_prefix ERROR: Failed to get fresh download URL for $sharepoint_path" >> "$LOG_FILE"
@@ -417,10 +446,27 @@ print(encoded)
             
             echo "$log_prefix DEBUG: Trying alternative encoding: $alt_encoded_path" >> "$LOG_FILE"
             
-            # Try with alternative encoding
-            local alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-                "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
-                jq -r '."@microsoft.graph.downloadUrl" // empty')
+            # Try with alternative encoding (with retry logic)
+            local alt_download_url=""
+            local alt_retry_count=0
+            local alt_max_retries=2
+            
+            while [ $alt_retry_count -lt $alt_max_retries ]; do
+                if [ $alt_retry_count -gt 0 ]; then
+                    sleep $((alt_retry_count * 3))
+                fi
+                
+                alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                    "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
+                    jq -r '."@microsoft.graph.downloadUrl" // empty')
+                
+                if [ -n "$alt_download_url" ] && [ "$alt_download_url" != "null" ]; then
+                    break
+                fi
+                
+                alt_retry_count=$((alt_retry_count + 1))
+                echo "$log_prefix DEBUG: Alternative encoding attempt $alt_retry_count failed, retrying..." >> "$LOG_FILE"
+            done
             
             if [ -n "$alt_download_url" ] && [ "$alt_download_url" != "null" ]; then
                 echo "$log_prefix DEBUG: Alternative encoding worked!" >> "$LOG_FILE"
@@ -462,6 +508,7 @@ print(encoded)
         --max-connections 4 \
         --output none 2>/dev/null; then
         echo "$log_prefix SUCCESS: $azure_path" >> "$LOG_FILE"
+        echo "$azure_path" >> "$SUCCESS_FILE"
     else
         echo "$log_prefix ERROR: Failed to upload $azure_path" >> "$LOG_FILE"
         rm -f "$temp_file"
@@ -474,7 +521,7 @@ print(encoded)
 }
 
 export -f process_file
-export ACCESS_TOKEN AZURE_STORAGE_CONNECTION_STRING TEMP_DIR LOG_FILE FOLDER_QUEUE SITE_ID
+export ACCESS_TOKEN AZURE_STORAGE_CONNECTION_STRING TEMP_DIR LOG_FILE FOLDER_QUEUE SITE_ID SUCCESS_FILE
 
 # --- 8. Process files in parallel ---
 log "Starting parallel processing with $MAX_PARALLEL_JOBS jobs..."
@@ -518,20 +565,25 @@ fi
 log "Processing completed! Generating summary..."
 
 SUCCESSFUL=$(grep -c "SUCCESS:" "$LOG_FILE" 2>/dev/null || echo "0")
+SKIPPED=$(grep -c "SKIP:" "$LOG_FILE" 2>/dev/null || echo "0")
 FAILED=$(grep -c "ERROR:" "$LOG_FILE" 2>/dev/null || echo "0")
 DOWNLOAD_ERRORS=$(grep -c "Failed to download" "$LOG_FILE" 2>/dev/null || echo "0")
 UPLOAD_ERRORS=$(grep -c "Failed to upload" "$LOG_FILE" 2>/dev/null || echo "0")
 
 # Calculate completion percentage
-COMPLETION_PERCENT=$((SUCCESSFUL * 100 / (TOTAL_FILES > 0 ? TOTAL_FILES : 1)))
+PROCESSED=$((SUCCESSFUL + SKIPPED))
+COMPLETION_PERCENT=$((PROCESSED * 100 / (TOTAL_FILES > 0 ? TOTAL_FILES : 1)))
 
 log "==================== COPY OPERATION SUMMARY ===================="
 log "Total files discovered: $TOTAL_FILES"
-log "Successfully copied: $SUCCESSFUL ($COMPLETION_PERCENT%)"
+log "Successfully copied: $SUCCESSFUL"
+log "Skipped (already uploaded): $SKIPPED"
+log "Total processed: $PROCESSED ($COMPLETION_PERCENT%)"
 log "Failed: $FAILED"
 log "  - Download failures: $DOWNLOAD_ERRORS"
 log "  - Upload failures: $UPLOAD_ERRORS"
 log "Container: $AZURE_STORAGE_CONTAINER_NAME"
+log "Success tracking file: $SUCCESS_FILE"
 log "Log file: $LOG_FILE"
 
 if [ $FAILED -gt 0 ]; then
