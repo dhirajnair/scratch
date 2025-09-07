@@ -4,19 +4,18 @@ S&P Global Business Involvement Screens Processor for Databricks
 
 This script processes S&P Global Business Involvement Screens Excel files,
 extracts data for three categories, aggregates this data from all files,
-and generates unified Excel output files.
+and generates unified CSV output files.
 
 FEATURES:
 - Reads from Azure Blob Storage
-- Generates combined Excel file with single unified sheet
-- Creates separate Excel files for individual data types (Company Details, BIS, PS)
+- Generates combined CSV file with unified data
+- Creates separate CSV files for individual data types (Company Details, BIS, PS)
 - Parallel processing with error handling and retry logic
 - Comprehensive logging and file tracking
 
 Requirements:
     - pandas
-    - openpyxl
-    - xlrd
+    - xlrd (for reading .xls input files)
     - dbutils (provided by Databricks runtime)
 
 Azure Blob Storage Configuration:
@@ -28,8 +27,8 @@ import re
 import pandas as pd
 import traceback
 from pathlib import Path
-import openpyxl # For .xlsx
-import xlrd     # For .xls
+# Excel reading libraries (still needed for input file processing)
+import xlrd     # For .xls input files
 from copy import copy
 import time
 import logging
@@ -87,8 +86,8 @@ OUTPUT_DIR = f"abfss://{CONTAINER_NAME}@{STORAGE_ACCOUNT_NAME}.dfs.core.windows.
 ERROR_DIR = f"{OUTPUT_DIR}/errors"
 LOG_DIR = f"{OUTPUT_DIR}/logs"
 
-# Excel Output Configuration
-EXCEL_OUTPUT_FILE = f"{OUTPUT_DIR}/unified_company_esg_data.xlsx"
+# CSV Output Configuration
+CSV_OUTPUT_FILE = f"{OUTPUT_DIR}/unified_company_esg_data.csv"
 
 # Initialize Spark Session for distributed processing
 spark = SparkSession.builder.appName("S&P_ESG_Processor").getOrCreate()
@@ -715,10 +714,10 @@ def sanitize_column_name(col_name):
     return name.lower()
 
 
-def create_unified_excel_file(company_details_data, bis_data, ps_data, output_file_path):
+def create_unified_csv_files(company_details_data, bis_data, ps_data, output_file_path):
     """
-    Create a unified Excel file with comprehensive company data in a single sheet.
-    Also creates separate Excel files for individual data types.
+    Create a unified CSV file with comprehensive company data.
+    Also creates separate CSV files for individual data types.
     """
     try:
         # Convert lists to DataFrames
@@ -737,13 +736,13 @@ def create_unified_excel_file(company_details_data, bis_data, ps_data, output_fi
         else:
             ps_df = pd.DataFrame()
         
-        # Get safe paths for Excel file creation (always use Azure temp)
+        # Get safe paths for CSV file creation (always use Azure temp)
         timestamp = int(time.time())
-        local_excel_path = f"/Workspace/tmp/unified_company_esg_data_{timestamp}.xlsx"
-        azure_temp_path = f"{TEMP_DIR}/unified_company_esg_data_{timestamp}.xlsx"
+        local_csv_path = f"/Workspace/tmp/unified_company_esg_data_{timestamp}.csv"
+        azure_temp_path = f"{TEMP_DIR}/unified_company_esg_data_{timestamp}.csv"
         os.makedirs("/Workspace/tmp", exist_ok=True)
         
-        # === CREATE MAIN UNIFIED EXCEL FILE (SINGLE SHEET) ===
+        # === CREATE MAIN UNIFIED CSV FILE ===
         if not cd_df.empty:
             # Group BIS data by key
             bis_grouped = {}
@@ -840,61 +839,59 @@ def create_unified_excel_file(company_details_data, bis_data, ps_data, output_fi
                 }
                 unified_data.append(unified_record)
             
-            # Create main Excel file with single unified sheet
-            with pd.ExcelWriter(local_excel_path, engine='openpyxl') as writer:
-                if unified_data:
-                    unified_df = pd.DataFrame(unified_data)
-                    unified_df.to_excel(writer, sheet_name='Unified_Company_ESG_Data', index=False)
-                    logger.info(f"Created unified Excel with {len(unified_df)} company records")
+            # Create main CSV file
+            if unified_data:
+                unified_df = pd.DataFrame(unified_data)
+                unified_df.to_csv(local_csv_path, index=False)
+                logger.info(f"Created unified CSV with {len(unified_df)} company records")
         
         # Copy main file to final output location via Azure temp
-        dbutils.fs.cp(f"file:{local_excel_path}", azure_temp_path)
+        dbutils.fs.cp(f"file:{local_csv_path}", azure_temp_path)
         dbutils.fs.cp(azure_temp_path, output_file_path)
         # Clean up both local and Azure temp
-        os.remove(local_excel_path)
+        os.remove(local_csv_path)
         dbutils.fs.rm(azure_temp_path)
         
-        logger.info(f"Successfully created main unified Excel file: {output_file_path}")
+        logger.info(f"Successfully created main unified CSV file: {output_file_path}")
         
-        # === CREATE SEPARATE EXCEL FILES FOR INDIVIDUAL DATA TYPES ===
+        # === CREATE SEPARATE CSV FILES FOR INDIVIDUAL DATA TYPES ===
         base_path = output_file_path.rsplit('/', 1)[0]
-        timestamp = output_file_path.split('_')[-1].replace('.xlsx', '')
+        timestamp = output_file_path.split('_')[-1].replace('.csv', '')
         
-        def create_and_copy_excel(df, sheet_name, file_prefix, output_path):
-            """Helper function to create Excel files via Azure temp"""
-            local_path = f"/Workspace/tmp/{file_prefix}_{int(time.time())}.xlsx"
-            azure_temp_path = f"{TEMP_DIR}/{file_prefix}_{int(time.time())}.xlsx"
+        def create_and_copy_csv(df, file_prefix, output_path):
+            """Helper function to create CSV files via Azure temp"""
+            local_path = f"/Workspace/tmp/{file_prefix}_{int(time.time())}.csv"
+            azure_temp_path = f"{TEMP_DIR}/{file_prefix}_{int(time.time())}.csv"
             
-            with pd.ExcelWriter(local_path, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+            df.to_csv(local_path, index=False)
             
             dbutils.fs.cp(f"file:{local_path}", azure_temp_path)
             dbutils.fs.cp(azure_temp_path, output_path)
             os.remove(local_path)
             dbutils.fs.rm(azure_temp_path)
         
-        # Create separate Company Details Excel
+        # Create separate Company Details CSV
         if not cd_df.empty:
-            cd_output_path = f"{base_path}/company_details_{timestamp}.xlsx"
-            create_and_copy_excel(cd_df, 'Company_Details', 'company_details', cd_output_path)
-            logger.info(f"Created separate Company Details Excel: {cd_output_path}")
+            cd_output_path = f"{base_path}/company_details_{timestamp}.csv"
+            create_and_copy_csv(cd_df, 'company_details', cd_output_path)
+            logger.info(f"Created separate Company Details CSV: {cd_output_path}")
         
-        # Create separate BIS Excel
+        # Create separate BIS CSV
         if not bis_df.empty:
-            bis_output_path = f"{base_path}/business_involvement_screens_{timestamp}.xlsx"
-            create_and_copy_excel(bis_df, 'Business_Involvement_Screens', 'business_involvement', bis_output_path)
-            logger.info(f"Created separate BIS Excel: {bis_output_path}")
+            bis_output_path = f"{base_path}/business_involvement_screens_{timestamp}.csv"
+            create_and_copy_csv(bis_df, 'business_involvement', bis_output_path)
+            logger.info(f"Created separate BIS CSV: {bis_output_path}")
         
-        # Create separate PS Excel
+        # Create separate PS CSV
         if not ps_df.empty:
-            ps_output_path = f"{base_path}/products_services_{timestamp}.xlsx"
-            create_and_copy_excel(ps_df, 'Products_Services', 'products_services', ps_output_path)
-            logger.info(f"Created separate PS Excel: {ps_output_path}")
+            ps_output_path = f"{base_path}/products_services_{timestamp}.csv"
+            create_and_copy_csv(ps_df, 'products_services', ps_output_path)
+            logger.info(f"Created separate PS CSV: {ps_output_path}")
         
         return True, output_file_path
         
     except Exception as e:
-        error_msg = f"Error creating unified Excel file: {str(e)}"
+        error_msg = f"Error creating unified CSV files: {str(e)}"
         logger.error(error_msg)
         logger.debug(traceback.format_exc())
         return False, error_msg
@@ -1085,35 +1082,35 @@ def main():
         
         logger.info(f"Completed batch {batch_idx+1}/{total_batches}: {successful_batch_files} success, {len(failed_batch_files)} failures")
     
-    # Generate unified Excel file after all batches are processed
+    # Generate unified CSV file after all batches are processed
     if headers_captured_flag and (all_company_details_rows or all_bis_rows or all_ps_rows):
-        logger.info("=== Generating Unified Excel File ===")
+        logger.info("=== Generating Unified CSV File ===")
         logger.info(f"Total data collected - Company Details: {len(all_company_details_rows)}, BIS: {len(all_bis_rows)}, PS: {len(all_ps_rows)} rows")
         
-        # Prepare data for Excel generation
+        # Prepare data for CSV generation
         company_details_data = [company_details_headers] + all_company_details_rows if company_details_headers and all_company_details_rows else []
         bis_data = [bis_headers] + all_bis_rows if bis_headers and all_bis_rows else []
         ps_data = [ps_headers] + all_ps_rows if ps_headers and all_ps_rows else []
         
-        # Generate timestamped Excel filename
+        # Generate timestamped CSV filename
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        excel_output_path = f"{OUTPUT_DIR}/unified_company_esg_data_{timestamp}.xlsx"
+        csv_output_path = f"{OUTPUT_DIR}/unified_company_esg_data_{timestamp}.csv"
         
-        success, result = create_unified_excel_file(
+        success, result = create_unified_csv_files(
             company_details_data, 
             bis_data, 
             ps_data, 
-            excel_output_path
+            csv_output_path
         )
         
         if success:
-            logger.info(f"✓ Successfully generated main unified Excel file: {excel_output_path}")
-            logger.info(f"✓ Also created separate Excel files for individual data types")
-            logger.info(f"Excel files contain data from {total_successful_files} processed files")
+            logger.info(f"✓ Successfully generated main unified CSV file: {csv_output_path}")
+            logger.info(f"✓ Also created separate CSV files for individual data types")
+            logger.info(f"CSV files contain data from {total_successful_files} processed files")
         else:
-            logger.error(f"✗ Failed to generate Excel files: {result}")
+            logger.error(f"✗ Failed to generate CSV files: {result}")
     else:
-        logger.warning("No data available for Excel generation or headers not captured")
+        logger.warning("No data available for CSV generation or headers not captured")
     
     # Update tracking file with all successfully processed files
     if newly_processed_in_this_run:
@@ -1174,15 +1171,15 @@ def main():
         for f_name, err_msg in total_failed_files:
             logger.info(f"   • {f_name}: {err_msg}")
     
-    # Excel Output Summary
+    # CSV Output Summary
     if headers_captured_flag:
         logger.info("")
-        logger.info("📁 EXCEL OUTPUT FILES GENERATED:")
+        logger.info("📁 CSV OUTPUT FILES GENERATED:")
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        logger.info(f"   • Main unified file: unified_company_esg_data_{timestamp}.xlsx")
-        logger.info(f"   • Company details: company_details_{timestamp}.xlsx")
-        logger.info(f"   • Business involvement: business_involvement_screens_{timestamp}.xlsx")
-        logger.info(f"   • Products services: products_services_{timestamp}.xlsx")
+        logger.info(f"   • Main unified file: unified_company_esg_data_{timestamp}.csv")
+        logger.info(f"   • Company details: company_details_{timestamp}.csv")
+        logger.info(f"   • Business involvement: business_involvement_screens_{timestamp}.csv")
+        logger.info(f"   • Products services: products_services_{timestamp}.csv")
         logger.info(f"   • All files saved to: {OUTPUT_DIR}")
     
     # Success/Failure Status

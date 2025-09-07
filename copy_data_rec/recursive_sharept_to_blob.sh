@@ -48,6 +48,9 @@ fi
 # Conservative setting to avoid SharePoint API rate limits
 MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-20}
 
+# Rate limiting delays (in seconds)
+API_CALL_DELAY=${API_CALL_DELAY:-0.3}
+
 # Validate required environment variables
 if [ -z "$GRAPH_TENANT_ID" ] || [ -z "$GRAPH_CLIENT_ID" ] || [ -z "$GRAPH_CLIENT_SECRET" ] || [ -z "$AZURE_STORAGE_CONNECTION_STRING" ]; then
     log "ERROR: Missing required authentication environment variables"
@@ -198,6 +201,7 @@ get_files_recursive() {
                 local batch_page=$((page_index + i + 1))
                 
                 (
+                    sleep "$API_CALL_DELAY"
                     local response=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" "$page_url")
                     local page_files=0
                     local page_folders=0
@@ -245,7 +249,7 @@ get_files_recursive() {
             log "Completed batch $batch_start-$batch_end of ${#page_urls[@]} pages"
             
             # Small delay between batches to avoid rate limiting
-            sleep 0.2
+            sleep 1.0
         done
         
         echo "[Discovery Job $job_id] Completed parallel pagination for: $folder_path" >> "$LOG_FILE"
@@ -261,6 +265,7 @@ get_files_recursive() {
         page_count=$((page_count + 1))
         log "  Processing page $page_count for folder: $folder_path"
         
+        sleep "$API_CALL_DELAY"
         local response=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" "$api_url")
         
         # Check if request was successful
@@ -418,6 +423,7 @@ print(encoded)
                 sleep $((retry_count * 2))
             fi
             
+            sleep "$API_CALL_DELAY"
             fresh_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
                 "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$encoded_path" | \
                 jq -r '."@microsoft.graph.downloadUrl" // empty')
@@ -456,6 +462,7 @@ print(encoded)
                     sleep $((alt_retry_count * 3))
                 fi
                 
+                sleep "$API_CALL_DELAY"
                 alt_download_url=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
                     "https://graph.microsoft.com/v1.0/sites/$SITE_ID/drive/root:/$alt_encoded_path" | \
                     jq -r '."@microsoft.graph.downloadUrl" // empty')
