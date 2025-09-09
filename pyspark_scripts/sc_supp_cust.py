@@ -2,6 +2,7 @@
 # This script processes Excel files containing customer and supplier data and extracts them into CSV files
 
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 import os
 import pandas as pd
 import glob
@@ -10,9 +11,18 @@ import datetime
 import traceback
 import csv
 import logging
-from io import StringIO
+from io import StringIO, BytesIO
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 import openpyxl
+import re
+from azure.storage.blob import BlobServiceClient
+import concurrent.futures
+import threading
+import time
+import random
+import uuid
+from collections import defaultdict
+import io
 
 # Initialize Spark session
 spark = SparkSession.builder.appName("ExcelDataProcessor").getOrCreate()
@@ -25,11 +35,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure paths for Databricks environment
-input_directory = "dbfs:/mnt/source_data/Data_From_OneDrive/Data/S&P/lot6_clean/"
-output_directory = "dbfs:/mnt/source_data/Data/s_and_p_csv/lot6aoutput"
-log_directory = "dbfs:/mnt/source_data/Data/s_and_p_csv/lot6aoutput/logs"
-debug_mode = False
+CONNECTION_STRING = config["connection_string"]
+STORAGE_ACCOUNT_NAME = config["storage_account"]  # Replace with your storage account name
+CONTAINER_NAME = "raw-data"              # Replace with your container name
+
+# Path Configuration
+BASE_PATH = "2.SupplyChain/SNP/30-April-2025/Suppliers"           # Base path within container
+INPUT_SUBPATH = ""                   # Subpath for input files
+OUTPUT_SUBPATH = "output"        # Subpath for output files
+
+# Processing Configuration
+debug_mode = True                              # Enable debug mode for better error logging
+
+# Build paths from configuration
+INPUT_DIR = "abfss://" + CONTAINER_NAME + "@" + STORAGE_ACCOUNT_NAME + ".dfs.core.windows.net/" + BASE_PATH
+if INPUT_SUBPATH:
+    INPUT_DIR = INPUT_DIR + "/" + INPUT_SUBPATH
+
+OUTPUT_DIR = "abfss://" + CONTAINER_NAME + "@" + STORAGE_ACCOUNT_NAME + ".dfs.core.windows.net/" + BASE_PATH + "/" + OUTPUT_SUBPATH
+LOG_DIR = OUTPUT_DIR + "/logs"
 
 # Create timestamp for this processing run
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -47,6 +71,139 @@ def dbfs_to_local(dbfs_path):
     if dbfs_path.startswith("dbfs:/"):
         return "/dbfs" + dbfs_path[5:]
     return dbfs_path
+
+def _read_excel_file_spark(abfss_path: str, sheet_name=0):
+    """
+    Read an .xlsx from ABFSS into a pandas DataFrame using dbutils approach.
+    This approach works better in Databricks environments.
+    """
+    try:
+        logger.debug(f"Starting to read Excel file from: {abfss_path}")
+        
+        # Use dbutils to check if file exists and get file info
+        try:
+            file_info = dbutils.fs.ls(abfss_path)
+            if not file_info:
+                logger.error(f"No files found at {abfss_path}")
+                return None
+        except Exception as e:
+            logger.error(f"Error accessing file {abfss_path}: {e}")
+            return None
+
+        # For abfss files, use the Azure Blob Storage approach
+        return _read_excel_file(abfss_path, os.path.basename(abfss_path))
+
+    except Exception as e:
+        logger.error(f"An error occurred while processing {abfss_path}: {e}")
+        return None
+
+def _validate_excel_file(stream, file_name):
+    """Validate if the downloaded file is a valid Excel file"""
+    try:
+        # Check file size
+        stream.seek(0, 2)  # Seek to end
+        file_size = stream.tell()
+        stream.seek(0)  # Reset to beginning
+        
+        if file_size == 0:
+            logger.error("❌ File is empty")
+            return False
+        
+        if file_size < 100:  # Excel files should be at least 100 bytes
+            logger.warning("⚠️ File is very small, may be corrupted")
+        
+        # Check file signature (first few bytes)
+        signature = stream.read(8)
+        stream.seek(0)  # Reset to beginning
+        
+        # Check for Excel file signatures
+        excel_signatures = [
+            b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1',  # OLE2 (older Excel)
+            b'PK\x03\x04',  # ZIP-based (newer Excel)
+        ]
+        
+        is_valid_excel = any(signature.startswith(sig) for sig in excel_signatures)
+        
+        if not is_valid_excel:
+            logger.warning("⚠️ File doesn't appear to be a valid Excel file based on signature")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error validating file: {e}")
+        return False
+
+def _read_excel_file(file_path: str, file_name: str):
+    """Read Excel file using Azure Blob Storage client and pandas (fallback method)"""
+    try:
+        # Extract blob info from abfss path
+        # Format: abfss://container@account.dfs.core.windows.net/path
+        match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+        if not match:
+            logger.error(f"❌ Invalid abfss path format: {file_path}")
+            return None
+        
+        container_name, account_name, blob_path = match.groups()
+        
+        # Get connection string from config
+        connection_string = CONNECTION_STRING
+        if not connection_string:
+            logger.error("❌ Azure connection string not found in config")
+            return None
+        
+        # Connect to blob storage
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+        
+        # Download file to memory
+        stream = BytesIO()
+        blob_data = blob_client.download_blob().readall()
+        stream.write(blob_data)
+        stream.seek(0)
+        
+        # Validate the file before attempting to read
+        if not _validate_excel_file(stream, file_name):
+            logger.error("❌ File validation failed")
+            return None
+        
+        # Read with pandas
+        # Determine the appropriate engine based on file extension
+        file_extension = os.path.splitext(file_name)[1].lower()
+        if file_extension == '.xls':
+            engine = 'xlrd'
+        elif file_extension == '.xlsx':
+            engine = 'openpyxl'
+        else:
+            # Default to xlrd for unknown extensions
+            engine = 'xlrd'
+        
+        try:
+            pandas_df = pd.read_excel(stream, sheet_name=0, engine=engine)  # Read first sheet
+            logger.info(f"✅ Successfully read Excel file: {file_name}, shape: {pandas_df.shape}")
+            return pandas_df
+        except Exception as pandas_error:
+            logger.error(f"❌ Pandas read_excel failed with engine {engine}: {pandas_error}")
+            logger.error(f"🔍 Full pandas error: {traceback.format_exc()}")
+            
+            # Check if it's the specific "array index out of range" error
+            if "array index out of range" in str(pandas_error).lower():
+                logger.warning("⚠️ Detected 'array index out of range' error - file may be corrupted or have unusual format")
+                logger.error(f"❌ Skipping corrupted file: {file_name}")
+                return None
+            
+            # Try alternative engines for .xls files
+            if file_extension == '.xls':
+                stream.seek(0)  # Reset stream position
+                logger.error(f"❌ Cannot read .xls file {file_name} - file may be corrupted")
+                return None
+            
+            # Re-raise the original error if all attempts failed
+            raise pandas_error
+                
+    except Exception as e:
+        logger.error(f"❌ Error reading Excel file {file_path}: {e}")
+        logger.error(f"🔍 Full error details: {traceback.format_exc()}")
+        return None
 
 # Extract company name from filename
 def extract_company_name(filename):
@@ -82,16 +239,58 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
     data_records = []
     
     try:
-        # Try to read the Excel file with pandas
-        excel_data = pd.ExcelFile(file_path)
+        # Try Spark-based reading first, fallback to Azure Blob Storage
+        df = _read_excel_file_spark(file_path)
+        if df is None:
+            df = _read_excel_file(file_path, os.path.basename(file_path))
+        
+        if df is None:
+            logger.error(f"❌ Failed to read Excel file: {file_path}")
+            return data_records
+        
+        # Convert DataFrame to rows for processing
+        rows = [df.columns.tolist()] + df.values.tolist()
+        
+        # For multi-sheet processing, we need to read the file again using Azure Blob Storage
+        # Use Azure Blob Storage method for multi-sheet processing
+        try:
+            # Extract blob info from abfss path
+            match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+            if not match:
+                if debug:
+                    logger.debug(f"Invalid abfss path format: {file_path}")
+                return data_records
+            
+            container_name, account_name, blob_path = match.groups()
+            
+            # Get connection string from config
+            connection_string = CONNECTION_STRING
+            if not connection_string:
+                if debug:
+                    logger.debug("Azure connection string not found in config")
+                return data_records
+            
+            # Connect to blob storage
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+            
+            # Download file to memory for ExcelFile processing
+            stream = BytesIO()
+            stream.write(blob_client.download_blob().readall())
+            stream.seek(0)
+            
+            # Try to read the Excel file with pandas for sheet processing
+            excel_data = pd.ExcelFile(stream)
+        except Exception as e:
+            if debug:
+                logger.debug(f"Azure Blob Storage reading failed: {e}")
+            return data_records
         
         # First, read the entire sheet to identify section markers
         for sheet_name in excel_data.sheet_names:
-            if debug:
-                logger.debug(f"Processing sheet {sheet_name} with pandas")
             
-            # Read the sheet without headers
-            df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+            # Read the sheet without headers using the stream
+            df_raw = pd.read_excel(stream, sheet_name=sheet_name, header=None)
             
             # Find rows that contain section markers
             section_markers = {}
@@ -99,8 +298,6 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                 for j, cell in enumerate(row):
                     if isinstance(cell, str) and "disclosed" in cell.lower():
                         section_markers[i] = cell.strip()
-                        if debug:
-                            logger.debug(f"Found section marker at row {i}: {cell}")
                         break
             
             # Process each section
@@ -111,16 +308,12 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                     for j, cell in enumerate(df_raw.iloc[i]):
                         if isinstance(cell, str) and "no data available" in cell.lower():
                             has_no_data = True
-                            if debug:
-                                logger.debug(f"Section '{section_name}' has 'No Data Available'")
                             break
                     if has_no_data:
                         break
                 
                 # Skip this section if it has no data
                 if has_no_data:
-                    if debug:
-                        logger.debug(f"Skipping section '{section_name}' because it has no data")
                     continue
                 
                 # Look for header row after the section marker
@@ -130,8 +323,6 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                         key_term = "customer name" if file_type == "customer" else "supplier name"
                         if isinstance(cell, str) and key_term in cell.lower():
                             header_row = i
-                            if debug:
-                                logger.debug(f"Found header row at {header_row} for section: {section_name}")
                             break
                     if header_row is not None:
                         break
@@ -148,7 +339,7 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                         # Calculate number of rows to read
                         nrows = next_section_row - header_row - 1 if next_section_row < float('inf') else None
                         
-                        df_section = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row, nrows=nrows)
+                        df_section = pd.read_excel(stream, sheet_name=sheet_name, header=header_row, nrows=nrows)
                         
                         # Clean the dataframe
                         df_section = df_section.dropna(how='all')
@@ -190,38 +381,28 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                             # Add the record
                             data_records.append(record)
                         
-                        if debug and data_records:
-                            logger.debug(f"Found {len(data_records)} records for section: {section_name}")
-                    
                     except Exception as e:
                         if debug:
                             logger.debug(f"Error processing section {section_name}: {e}")
             
             # If no data found using section approach, try a more direct approach
             if not data_records:
-                if debug:
-                    logger.debug("No data found using section markers, trying alternative approach")
                 
                 # Try different header rows
                 for header_row in range(0, 30):
                     try:
-                        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+                        df = pd.read_excel(stream, sheet_name=sheet_name, header=header_row)
                         
                         # Check if this looks like a data table
                         key_column = "Customer Name" if file_type == "customer" else "Supplier Name"
                         
                         if key_column in df.columns:
-                            if debug:
-                                logger.debug(f"Found {key_column} column in header row {header_row}")
-                            
                             # Check if there's a "No Data Available" right after the header
                             no_data_after_header = False
                             if header_row + 1 < len(df_raw):
                                 for j, cell in enumerate(df_raw.iloc[header_row + 1]):
                                     if isinstance(cell, str) and "no data" in cell.lower():
                                         no_data_after_header = True
-                                        if debug:
-                                            logger.debug(f"Found 'No Data Available' after header at row {header_row}")
                                         break
                             
                             if no_data_after_header:
@@ -292,8 +473,6 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                                 data_records.append(record)
                             
                             if data_records:
-                                if debug:
-                                    logger.debug(f"Found {len(data_records)} records with pandas (alternative approach)")
                                 return data_records
                     
                     except Exception as e:
@@ -312,264 +491,67 @@ def extract_data_from_excel(file_path, file_type, company_name, debug=False):
     data_records = []
     
     try:
-        # Try reading with openpyxl first for more control over cell access
-        try:
-            workbook = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
-            if debug:
-                logger.debug(f"Successfully loaded workbook with openpyxl")
-                logger.debug(f"Sheet names: {workbook.sheetnames}")
-            
-            sheet = workbook.active
-            
-            # Find all section headers (Recently Disclosed or Prior and Not Recently Disclosed)
-            section_markers = {}
-            for row_idx in range(1, min(500, sheet.max_row + 1)):
-                cell_value = sheet.cell(row=row_idx, column=1).value
-                if cell_value and isinstance(cell_value, str):
-                    cell_str = cell_value.strip()
-                    if "recently disclosed" in cell_str.lower():
-                        section_markers[row_idx] = cell_str
-                        if debug:
-                            logger.debug(f"Found section marker at row {row_idx}: {cell_str}")
-            
-            # Now look for header rows containing "Customer Name" or "Supplier Name"
-            for section_row, section_name in section_markers.items():
-                # Check if this section has "No Data Available"
-                has_no_data = False
-                for row_idx in range(section_row + 1, min(section_row + 5, sheet.max_row + 1)):
-                    cell_value = sheet.cell(row=row_idx, column=1).value
-                    if cell_value and isinstance(cell_value, str) and "no data available" in cell_value.lower():
-                        has_no_data = True
-                        if debug:
-                            logger.debug(f"Section '{section_name}' has 'No Data Available'")
-                        break
-                
-                # Skip this section if it has no data
-                if has_no_data:
-                    if debug:
-                        logger.debug(f"Skipping section '{section_name}' because it has no data")
-                    continue
-                
-                header_row_idx = None
-                column_headers = {}
-                
-                # Check rows after each section marker
-                for row_idx in range(section_row + 1, min(section_row + 10, sheet.max_row + 1)):
-                    for col_idx in range(1, min(30, sheet.max_column + 1)):
-                        cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                        
-                        if cell_value:
-                            cell_str = str(cell_value).strip().lower()
-                            
-                            # Check if this is a header row
-                            if (file_type == "customer" and "customer name" in cell_str) or \
-                               (file_type == "supplier" and "supplier name" in cell_str):
-                                header_row_idx = row_idx
-                                
-                                # Map column headers
-                                for col in range(1, min(30, sheet.max_column + 1)):
-                                    header_cell = sheet.cell(row=row_idx, column=col).value
-                                    if header_cell:
-                                        column_headers[col] = str(header_cell).strip()
-                                
-                                if debug:
-                                    logger.debug(f"Found header row at {header_row_idx} for section: {section_name}")
-                                    logger.debug(f"Column headers: {column_headers}")
-                                
-                                break
-                    
-                    if header_row_idx:
-                        break
-                
-                # If header row was found, extract data for this section
-                if header_row_idx:
-                    # Find the next section marker (if any)
-                    next_section_row = float('inf')
-                    for row in section_markers.keys():
-                        if row > header_row_idx and row < next_section_row:
-                            next_section_row = row
-                    
-                    # Process data rows between this header and next section (or end of data)
-                    for row_idx in range(header_row_idx + 1, min(next_section_row, sheet.max_row + 1)):
-                        # Check if this row has data
-                        row_has_data = False
-                        key_value_present = False
-                        
-                        # First check if the key field (Customer/Supplier Name) is present
-                        key_field_col = None
-                        for col, header in column_headers.items():
-                            key_field = "Customer Name" if file_type == "customer" else "Supplier Name"
-                            if header == key_field:
-                                key_field_col = col
-                                break
-                        
-                        if key_field_col:
-                            key_value = sheet.cell(row=row_idx, column=key_field_col).value
-                            if key_value:
-                                key_value_present = True
-                                # Skip rows with no data available message
-                                if isinstance(key_value, str) and "no data" in key_value.lower():
-                                    if debug:
-                                        logger.debug(f"Skipping row {row_idx} with 'No Data' in key field")
-                                    continue
-                        
-                        # Check if the row has any data
-                        for col in range(1, min(30, sheet.max_column + 1)):
-                            if sheet.cell(row=row_idx, column=col).value:
-                                row_has_data = True
-                                break
-                        
-                        if not row_has_data or not key_value_present:
-                            continue
-                        
-                        # Extract data from this row
-                        row_data = {}
-                        
-                        # Set company name
-                        row_data["Company Name"] = company_name
-                        
-                        # Set disclosed information from the section name
-                        row_data["Disclosed Information"] = section_name
-                        
-                        # Extract description (often ticker symbol in format like OTCPK:LICT (MI KEY: 4137440; SPCIQ KEY: 402730))
-                        description_value = None
-                        
-                        # Try to find description in the company description rows at the top
-                        for row in range(1, section_row):
-                            # Usually a description/ticker contains "KEY:" 
-                            for col in [1, 2]:
-                                cell_value = sheet.cell(row=row, column=col).value
-                                if cell_value and isinstance(cell_value, str) and "KEY:" in cell_value:
-                                    description_value = cell_value.strip()
-                                    break
-                            if description_value:
-                                break
-                        
-                        if description_value:
-                            row_data["Description"] = description_value
-                        else:
-                            row_data["Description"] = ""
-                        
-                        # Map other columns based on headers
-                        for col, header in column_headers.items():
-                            cell_value = sheet.cell(row=row_idx, column=col).value
-                            
-                            # Skip empty cells
-                            if cell_value is None:
-                                row_data[header] = ""
-                                continue
-                            
-                            # Round specific numeric columns to 2 decimal places to match Excel display
-                            numeric_columns = [
-                                "Supplier Expense ($M)", "Supplier Expense (%)", 
-                                "Min %", "Max %", "Min Value ($M)", "Max Value ($M)",
-                                "Customer Revenue ($M)", "Customer Revenue (%)"
-                            ]
-                            
-                            if header in numeric_columns and isinstance(cell_value, (int, float)):
-                                # Round to 2 decimal places to match Excel display
-                                cell_value = round(cell_value, 2)
-                            # Clean string values
-                            elif isinstance(cell_value, str):
-                                cell_value = cell_value.strip()
-                            
-                            # Add to row data
-                            row_data[header] = cell_value
-                        
-                        # Check if this is a valid data row (contains customer/supplier name)
-                        key_field = "Customer Name" if file_type == "customer" else "Supplier Name"
-                        
-                        if key_field in row_data and row_data[key_field]:
-                            # Skip rows that are just section headers or contain metadata
-                            key_value = str(row_data[key_field]).lower()
-                            if "disclosed" in key_value or "name" in key_value or "no data" in key_value:
-                                continue
-                            
-                            # Add the record
-                            data_records.append(row_data)
-            
-            # If we couldn't find data using section markers, try a more general approach
-            if not data_records:
-                # Similar general approach as in the original code...
-                header_row_idx = None
-                column_headers = {}
-                
-                for row_idx in range(1, min(50, sheet.max_row + 1)):
-                    for col_idx in range(1, min(30, sheet.max_column + 1)):
-                        cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                        
-                        if cell_value:
-                            cell_str = str(cell_value).strip().lower()
-                            
-                            if (file_type == "customer" and "customer name" in cell_str) or \
-                                (file_type == "supplier" and "supplier name" in cell_str):
-                                # Found header row
-                                header_row_idx = row_idx
-                                
-                                # Map headers and extract data as in the original code
-                                # Map column headers
-                                for col in range(1, min(30, sheet.max_column + 1)):
-                                    header_cell = sheet.cell(row=row_idx, column=col).value
-                                    if header_cell:
-                                        column_headers[col] = str(header_cell).strip()
-                                break
-                    
-                    if header_row_idx:
-                        break
-                
-                # If header row was found, extract data
-                if header_row_idx:
-                    # Processing similar to the section-based extraction...
-                    # Extract data using the header row
-                    for row_idx in range(header_row_idx + 1, sheet.max_row + 1):
-                        # Extract row data similar to the original code
-                        row_has_data = False
-                        for col in range(1, min(30, sheet.max_column + 1)):
-                            if sheet.cell(row=row_idx, column=col).value:
-                                row_has_data = True
-                                break
-                        
-                        if not row_has_data:
-                            continue
-                        
-                        # Create and populate row_data dictionary
-                        row_data = {}
-                        row_data["Company Name"] = company_name
-                        row_data["Disclosed Information"] = ""
-                        row_data["Description"] = ""
-                        
-                        # Map other columns based on headers
-                        for col, header in column_headers.items():
-                            cell_value = sheet.cell(row=row_idx, column=col).value
-                            
-                            # Process cell value
-                            if cell_value is None:
-                                row_data[header] = ""
-                            elif isinstance(cell_value, (int, float)) and header in [
-                                "Supplier Expense ($M)", "Supplier Expense (%)", 
-                                "Min %", "Max %", "Min Value ($M)", "Max Value ($M)",
-                                "Customer Revenue ($M)", "Customer Revenue (%)"
-                            ]:
-                                row_data[header] = round(cell_value, 2)
-                            elif isinstance(cell_value, str):
-                                row_data[header] = cell_value.strip()
-                            else:
-                                row_data[header] = cell_value
-                        
-                        # Check if this is a valid data row
-                        key_field = "Customer Name" if file_type == "customer" else "Supplier Name"
-                        if key_field in row_data and row_data[key_field]:
-                            # Skip rows that are just section headers or contain metadata
-                            key_value = str(row_data[key_field]).lower()
-                            if "disclosed" in key_value or "name" in key_value or "no data" in key_value:
-                                continue
-                            
-                            # Add the record
-                            data_records.append(row_data)
+        # Try Spark-based reading first, fallback to Azure Blob Storage
+        df = _read_excel_file_spark(file_path)
+        if df is None:
+            df = _read_excel_file(file_path, os.path.basename(file_path))
         
-        except InvalidFileException as e:
-            # Fall back to pandas if openpyxl fails
-            data_records = extract_data_with_pandas(file_path, file_type, company_name, debug)
+        if df is None:
+            logger.error(f"❌ Failed to read Excel file: {file_path}")
+            return data_records
+        
+        # Convert DataFrame to rows for processing
+        rows = [df.columns.tolist()] + df.values.tolist()
+        
+        # For openpyxl processing, we need to read the file again using Azure Blob Storage
+        # Use Azure Blob Storage method for openpyxl processing
+        try:
+            # Extract blob info from abfss path
+            match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+            if not match:
+                if debug:
+                    logger.debug(f"Invalid abfss path format: {file_path}")
+                return data_records
+            
+            container_name, account_name, blob_path = match.groups()
+            
+            # Get connection string from config
+            connection_string = CONNECTION_STRING
+            if not connection_string:
+                if debug:
+                    logger.debug("Azure connection string not found in config")
+                return data_records
+            
+            # Connect to blob storage
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+            
+            # Download file to memory for openpyxl processing
+            stream = BytesIO()
+            stream.write(blob_client.download_blob().readall())
+            stream.seek(0)
+        except Exception as e:
+            if debug:
+                logger.debug(f"Azure Blob Storage reading failed: {e}")
+            return data_records
+        
+        # Check if file is .xls format - if so, skip openpyxl and use pandas directly
+        file_extension = os.path.splitext(os.path.basename(file_path))[1].lower()
+        
+        if file_extension == '.xls':
+            # For .xls files, use pandas processing directly
+            try:
+                data_records = extract_data_with_pandas(file_path, file_type, company_name, debug)
+            except Exception as pandas_error:
+                logger.error(f"❌ Pandas processing failed: {pandas_error}")
+                data_records = []
+        else:
+            # For .xlsx files, use pandas processing directly (simpler and more reliable)
+            try:
+                data_records = extract_data_with_pandas(file_path, file_type, company_name, debug)
+            except Exception as pandas_error:
+                logger.error(f"❌ Pandas processing failed: {pandas_error}")
+                data_records = []
                 
     except Exception as e:
         if debug:
@@ -667,8 +649,8 @@ def process_excel_files():
     }
     
     # Ensure output and log directories exist
-    ensure_dir_exists(output_directory)
-    ensure_dir_exists(log_directory)
+    ensure_dir_exists(OUTPUT_DIR)
+    ensure_dir_exists(LOG_DIR)
     
     # Initialize lists to store combined data
     all_customer_data = []
@@ -691,24 +673,56 @@ def process_excel_files():
         "Min Value ($M)", "Max Value ($M)", "Source"
     ]
     
-    # Get list of Excel files
-    excel_files = [f.path for f in dbutils.fs.ls(input_directory) if f.path.endswith('.xls') or f.path.endswith('.xlsx')]
-    
-    if not excel_files:
-        logger.warning(f"No Excel files found in {input_directory}")
+    # Get list of Excel files from Azure Blob Storage
+    excel_files = []
+    try:
+        file_list = dbutils.fs.ls(INPUT_DIR)
+        for file_info in file_list:
+            if not file_info.isDir() and (file_info.path.endswith('.xls') or file_info.path.endswith('.xlsx')):
+                excel_files.append(file_info.path)
+    except Exception as e:
+        logger.error(f"Error listing files in {INPUT_DIR}: {e}")
         return
     
-    processing_summary["total_files"] = len(excel_files)
-    logger.info(f"Found {len(excel_files)} Excel file(s)")
+    # Check for previously processed files to avoid reprocessing
+    processed_files_path = f"{LOG_DIR}/processed_files.txt"
+    previously_processed = set()
+    
+    try:
+        # Read the processed_files.txt if it exists
+        processed_content = dbutils.fs.head(processed_files_path, 1000000)  # Read up to 1MB
+        if processed_content:
+            previously_processed = set(processed_content.decode('utf-8').strip().split('\n'))
+            previously_processed.discard('')  # Remove empty lines
+            logger.info(f"Found {len(previously_processed)} previously processed files")
+    except Exception as e:
+        logger.info("No processed_files.txt found, will process all files")
+    
+    # Filter out previously processed files
+    files_to_process = [f for f in excel_files if os.path.basename(f) not in previously_processed]
+    skipped_count = len(excel_files) - len(files_to_process)
+    
+    if skipped_count > 0:
+        logger.info(f"Skipping {skipped_count} previously processed files")
+    
+    excel_files = files_to_process
+    
+    if not excel_files:
+        logger.warning(f"No Excel files found in {INPUT_DIR}")
+        return
+    
+    processing_summary["total_files"] = len(excel_files) + skipped_count
+    logger.info(f"Found {len(excel_files) + skipped_count} Excel file(s) total")
+    if skipped_count > 0:
+        logger.info(f"Processing {len(excel_files)} new files, skipping {skipped_count} previously processed files")
     
     # Process files one by one
     logger.info("Processing files...")
     for file_path in excel_files:
-        local_path = dbfs_to_local(file_path)
-        filename = os.path.basename(local_path)
+        filename = os.path.basename(file_path)
         logger.info(f"Processing file: {filename}")
         
-        result = process_single_file(local_path, output_directory, debug_mode)
+        result = process_single_file(file_path, OUTPUT_DIR, debug_mode)
         
         if result is None:
             continue
@@ -749,6 +763,9 @@ def process_excel_files():
             
             processing_summary["successful_files"] += 1
             
+            # Add to processed files list
+            previously_processed.add(filename)
+            
         elif status == "skip":
             skipped_files.append({
                 "filename": filename,
@@ -783,33 +800,19 @@ def process_excel_files():
         # Fill NaN values with empty strings
         customer_df.fillna("", inplace=True)
         
-        # For large datasets in Databricks, use this approach:
-        # Convert to Spark DataFrame
-        customer_spark_df = spark.createDataFrame(customer_df)
+        # Write CSV directly using pandas to ensure proper CSV format
+        # Convert to CSV string
+        csv_content = customer_df.to_csv(index=False, quoting=csv.QUOTE_ALL, escapechar='"')
         
-        # Force coalesce to 1 partition to get a single output file
-        customer_spark_df = customer_spark_df.coalesce(1)
+        # Verify CSV format (first few lines should be readable)
+        lines = csv_content.split('\n')[:3]
+        logger.info(f"CSV format verification - First 3 lines: {lines}")
         
-        # Write to CSV with a temporary directory name
-        temp_output_path = f"{output_directory}/temp_customers_{timestamp}"
-        customer_spark_df.write.mode("overwrite").option("header", "true").option("quoteAll", "true").csv(temp_output_path)
+        # Write directly to DBFS
+        output_path = f"{OUTPUT_DIR}/customers.csv"
+        dbutils.fs.put(output_path, csv_content, overwrite=True)
         
-        # Get the part file path
-        part_files = [f.path for f in dbutils.fs.ls(temp_output_path) if f.name.startswith("part-")]
-        if part_files:
-            # First remove any existing file
-            try:
-                dbutils.fs.rm(f"{output_directory}/customers.csv")
-            except:
-                pass
-                
-            # Rename the part file to the final CSV name
-            dbutils.fs.mv(part_files[0], f"{output_directory}/customers.csv")
-            
-            # Clean up temporary directory
-            dbutils.fs.rm(temp_output_path, recurse=True)
-        
-        logger.info(f"Saved {len(all_customer_data)} customer records to {output_directory}/customers.csv")
+        logger.info(f"Saved {len(all_customer_data)} customer records to {OUTPUT_DIR}/customers.csv")
 
     # Write supplier data to CSV
     if all_supplier_data:
@@ -830,45 +833,33 @@ def process_excel_files():
         # Fill NaN values with empty strings
         supplier_df.fillna("", inplace=True)
         
-        # For large datasets in Databricks, use this approach:
-        # Convert to Spark DataFrame
-        supplier_spark_df = spark.createDataFrame(supplier_df)
+        # Write CSV directly using pandas to ensure proper CSV format
+        # Convert to CSV string
+        csv_content = supplier_df.to_csv(index=False, quoting=csv.QUOTE_ALL, escapechar='"')
         
-        # Force coalesce to 1 partition to get a single output file
-        supplier_spark_df = supplier_spark_df.coalesce(1)
+        # Verify CSV format (first few lines should be readable)
+        lines = csv_content.split('\n')[:3]
+        logger.info(f"CSV format verification - First 3 lines: {lines}")
         
-        # Write to CSV with a temporary directory name
-        temp_output_path = f"{output_directory}/temp_suppliers_{timestamp}"
-        supplier_spark_df.write.mode("overwrite").option("header", "true").option("quoteAll", "true").csv(temp_output_path)
+        # Write directly to DBFS
+        output_path = f"{OUTPUT_DIR}/suppliers.csv"
+        dbutils.fs.put(output_path, csv_content, overwrite=True)
         
-        # Get the part file path
-        part_files = [f.path for f in dbutils.fs.ls(temp_output_path) if f.name.startswith("part-")]
-        if part_files:
-            # First remove any existing file
-            try:
-                dbutils.fs.rm(f"{output_directory}/suppliers.csv")
-            except:
-                pass
-                
-            # Rename the part file to the final CSV name
-            dbutils.fs.mv(part_files[0], f"{output_directory}/suppliers.csv")
-            
-            # Clean up temporary directory
-            dbutils.fs.rm(temp_output_path, recurse=True)
-        
-        logger.info(f"Saved {len(all_supplier_data)} supplier records to {output_directory}/suppliers.csv")    
+        logger.info(f"Saved {len(all_supplier_data)} supplier records to {OUTPUT_DIR}/suppliers.csv")    
     
     # Generate processing summary and logs
-    summary_log = f"{log_directory}/processing_summary_{timestamp}.txt"
+    summary_log = f"{LOG_DIR}/processing_summary_{timestamp}.txt"
     
     # Create a summary log as string
     summary_content = f"""===== Excel Data Extraction Summary =====
 Run Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Input Directory: {input_directory}
-Output Directory: {output_directory}
+Input Directory: {INPUT_DIR}
+Output Directory: {OUTPUT_DIR}
 
 === Processing Statistics ===
 Total files found: {processing_summary['total_files']}
+Previously processed (skipped): {skipped_count}
+New files processed: {len(excel_files)}
 Successfully processed: {processing_summary['successful_files']}
 Failed to process: {processing_summary['failed_files']}
 Skipped (indeterminate type): {processing_summary['skipped_files']}
@@ -900,6 +891,12 @@ Total supplier records extracted: {processing_summary['supplier_records']}
     # Write summary log to DBFS
     dbutils.fs.put(summary_log, summary_content, overwrite=True)
     
+    # Update processed_files.txt with newly processed files
+    if previously_processed:
+        processed_content = '\n'.join(sorted(previously_processed))
+        dbutils.fs.put(processed_files_path, processed_content, overwrite=True)
+        logger.info(f"Updated processed_files.txt with {len(previously_processed)} files")
+    
     logger.info(f"\nSummary report written to: {summary_log}")
     
     # Also save detailed logs as CSV files
@@ -922,18 +919,18 @@ Total supplier records extracted: {processing_summary['supplier_records']}
         'reason': f.get('reason', 'Unknown')
     } for f in skipped_files])
     
-    # Save to CSV
+    # Save to CSV using direct pandas method
     if not successful_df.empty:
-        successful_spark_df = spark.createDataFrame(successful_df)
-        successful_spark_df.write.mode("overwrite").option("header", "true").csv(f"{log_directory}/successful_files_{timestamp}.csv")
+        csv_content = successful_df.to_csv(index=False, quoting=csv.QUOTE_ALL, escapechar='"')
+        dbutils.fs.put(f"{LOG_DIR}/successful_files_{timestamp}.csv", csv_content, overwrite=True)
     
     if not failed_df.empty:
-        failed_spark_df = spark.createDataFrame(failed_df)
-        failed_spark_df.write.mode("overwrite").option("header", "true").csv(f"{log_directory}/failed_files_{timestamp}.csv")
+        csv_content = failed_df.to_csv(index=False, quoting=csv.QUOTE_ALL, escapechar='"')
+        dbutils.fs.put(f"{LOG_DIR}/failed_files_{timestamp}.csv", csv_content, overwrite=True)
     
     if not skipped_df.empty:
-        skipped_spark_df = spark.createDataFrame(skipped_df)
-        skipped_spark_df.write.mode("overwrite").option("header", "true").csv(f"{log_directory}/skipped_files_{timestamp}.csv")
+        csv_content = skipped_df.to_csv(index=False, quoting=csv.QUOTE_ALL, escapechar='"')
+        dbutils.fs.put(f"{LOG_DIR}/skipped_files_{timestamp}.csv", csv_content, overwrite=True)
     
     # Print summary to console
     logger.info("\n===== Processing Summary =====")

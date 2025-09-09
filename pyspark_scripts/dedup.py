@@ -52,15 +52,14 @@ def cleanup_spark_session(spark, is_databricks_session=True):
             print("Cleaning up Spark session resources...")
             
             # Clear cache (safe for both Databricks and standalone)
-            spark.catalog.clearCache()
+            try:
+                spark.catalog.clearCache()
+                print("✓ Cleared Spark cache")
+            except Exception as cache_error:
+                print(f"Warning: Could not clear cache: {cache_error}")
             
-            # In Databricks, DON'T stop the session as it's shared
-            if not is_databricks_session:
-                print("Stopping Spark session...")
-                spark.stop()
-                SparkSession._instantiatedSession = None
-            else:
-                print("✓ Cleared Spark cache (keeping session active for Databricks)")
+            # Never stop the session - let Databricks manage it
+            print("✓ Kept Spark session active (managed by Databricks)")
             
             print("✓ Spark session cleanup completed")
             
@@ -398,8 +397,24 @@ def save_to_blob(df, storage_account, container, output_folder, file_format="xls
             dbutils.fs.rm(temp_csv_path, True)
         
     elif file_format.lower() == "csv":
-        # Use Spark distributed write for CSV
-        df.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+        # Use Spark distributed write for CSV with proper single file output
+        temp_csv_path = f"{output_path}_temp_csv"
+        
+        print("Saving as CSV using Spark distributed processing...")
+        df.coalesce(1).write.mode("overwrite").option("header", "true").csv(temp_csv_path)
+        
+        # Find the actual CSV file (Spark creates part files)
+        csv_files = dbutils.fs.ls(temp_csv_path)
+        csv_file = [f for f in csv_files if f.name.startswith('part-') and f.name.endswith('.csv')][0]
+        
+        # Copy the part file to the final location with proper name
+        final_csv_path = f"{output_path}/deduplicated_data.csv"
+        dbutils.fs.cp(csv_file.path, final_csv_path)
+        
+        # Clean up temp directory
+        dbutils.fs.rm(temp_csv_path, True)
+        
+        print(f"✓ CSV file saved to: {final_csv_path}")
     elif file_format.lower() == "parquet":
         # Use Spark distributed write for Parquet
         df.write.mode("overwrite").parquet(output_path)
@@ -418,8 +433,8 @@ def main():
     STORAGE_ACCOUNT = "dataingestiondl"       # Your Azure storage account
     CONTAINER = "raw-data"                    # Your container name  
     INPUT_FOLDER = "8.HNI/30-April-2025"     # Input folder path
-    OUTPUT_FOLDER = "8.HNI/dedup_output"     # Output folder path
-    FILE_FORMAT = "xlsx"                      # Output format: xlsx, csv, parquet, json
+    OUTPUT_FOLDER = "8.HNI/output"     # Output folder path
+    FILE_FORMAT = "csv"                      # Output format: xlsx, csv, parquet, json
     
     # Optional: specify columns for deduplication (None = all columns)
     DEDUP_COLUMNS = None  # e.g., ["column1", "column2"] or None for all columns
@@ -497,7 +512,10 @@ def main():
         try:
             # Clean up any temporary directories that might have been created
             if temp_directories:
-                cleanup_temp_directories(STORAGE_ACCOUNT, CONTAINER, temp_directories)
+                try:
+                    cleanup_temp_directories(STORAGE_ACCOUNT, CONTAINER, temp_directories)
+                except Exception as temp_cleanup_error:
+                    print(f"Warning: Error cleaning up temp directories: {temp_cleanup_error}")
             
             # Clean up workspace temp files
             print("Cleaning up workspace temp files...")
@@ -516,9 +534,10 @@ def main():
                 print(f"Warning: Error during workspace cleanup: {e}")
             
             # Clean up Spark session (most important)
-            # Use proper Databricks environment detection
-            is_databricks = is_databricks_environment()
-            cleanup_spark_session(spark, is_databricks_session=is_databricks)
+            try:
+                cleanup_spark_session(spark, is_databricks_session=True)
+            except Exception as spark_cleanup_error:
+                print(f"Warning: Error during Spark cleanup: {spark_cleanup_error}")
             
         except Exception as cleanup_error:
             print(f"⚠️ Error during cleanup: {cleanup_error}")

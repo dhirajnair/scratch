@@ -1,14 +1,3 @@
-
-import logging
-import pandas as pd
-import re
-from pyspark.sql import SparkSession, DataFrame
-import io
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("CQDataIngestion")
-
 def _normalize_column_name(col_name: str) -> str:
     """
     Normalizes a column name by converting to lowercase, replacing special characters with underscores,
@@ -23,49 +12,81 @@ def _normalize_column_name(col_name: str) -> str:
     col_name = col_name.strip('_')
     return col_name
 
-def read_excel(abfss_path: str, sheet_name=0) -> DataFrame | None:
+
+def _make_unique_columns(cols):
+    """Append suffixes to duplicate column names to make them unique while keeping a readable form."""
+    counts = Counter()
+    unique = []
+    for c in cols:
+        counts[c] += 1
+        if counts[c] == 1:
+            unique.append(c)
+        else:
+            unique.append(f"{c}__dup{counts[c]-1}")
+    return unique
+
+
+def read_excel(abfss_path: str, sheet_name=0) -> "pyspark.sql.DataFrame | None":
     """
-    Reads an Excel file from an ABFSS path, normalizes column names, and returns a Spark DataFrame.
-    This function requires the 'openpyxl' library to be installed to read .xlsx files.
-
-    Args:
-        abfss_path (str): The full ABFSS path to the Excel file (e.g., 'abfss://container@storageaccount.dfs.core.windows.net/path/to/file.xlsx').
-        sheet_name (str or int, optional): The name or index of the sheet to read. Defaults to 0 (the first sheet).
-
-    Returns:
-        pyspark.sql.DataFrame: A Spark DataFrame with the data from the Excel file and normalized column names.
-        Returns None if an error occurs.
+    Read an .xlsx from ABFSS into a Spark DataFrame (all-string schema).
+    Assumes helper functions `_normalize_column_name(name: str) -> str`
+    and `_make_unique_columns(cols: list[str]) -> list[str]` are available.
     """
     try:
         logger.info(f"Starting to read Excel file from: {abfss_path}")
-
-        # Get the active Spark session
         spark = SparkSession.builder.getOrCreate()
 
-        # Spark can read the binary content of the file. This avoids issues with DBFS mounts.
-        # This reads the entire file into the driver's memory, so it's suitable for moderately sized Excel files.
+        # read binaryFile and pick first matching file
         logger.info("Reading file content as binary.")
-        file_content = spark.read.format("binaryFile").load(abfss_path).collect()[0]['content']
+        bin_df = spark.read.format("binaryFile").load(abfss_path)
+        if bin_df.count() == 0:
+            logger.error(f"No files found at {abfss_path}")
+            return None
+        row = bin_df.select("content", "path").limit(1).collect()[0]
+        file_content = row["content"]
+        actual_path = row["path"]
+        if file_content is None:
+            logger.error("binaryFile returned empty content.")
+            return None
 
-        # Read the binary content into a pandas DataFrame
+        # parse into pandas
         logger.info("Parsing Excel data using pandas.")
-        pandas_df = pd.read_excel(io.BytesIO(file_content), sheet_name=sheet_name, engine='openpyxl')
+        pandas_df = pd.read_excel(io.BytesIO(file_content), sheet_name=sheet_name, engine="openpyxl")
 
-        # Normalize column names
+        # --- normalize column names (use existing helpers) ---
         logger.info("Normalizing column names.")
-        normalized_columns = {col: _normalize_column_name(col) for col in pandas_df.columns}
-        pandas_df = pandas_df.rename(columns=normalized_columns)
-        logger.info(f"Normalized column names: {list(pandas_df.columns)}")
+        orig_cols = list(pandas_df.columns)
+        normalized = [_normalize_column_name(c) for c in orig_cols]        # assumes helper exists
+        unique_cols = _make_unique_columns(normalized)                   # assumes helper exists
 
-        # Convert pandas DataFrame to Spark DataFrame
+        if unique_cols != normalized:
+            logger.warning("Found duplicate column names after normalization. Added suffixes to make them unique.")
+            for orig, norm, uniq in zip(orig_cols, normalized, unique_cols):
+                if norm != uniq:
+                    logger.debug(f"  {orig!r} -> {uniq!r}")
+
+        # assign unique names back (DO NOT call rename with a list)
+        pandas_df.columns = unique_cols
+        logger.debug(f"Final column names ({len(pandas_df.columns)}): {pandas_df.columns.tolist()[:50]}")
+
+        # Force all values to string and restore None for missing
+        pandas_df = pandas_df.astype(str).where(pandas_df.notna(), None)
+
+        # explicit all-string schema to avoid Spark inference issues
+        schema = StructType([StructField(str(c), StringType(), True) for c in pandas_df.columns])
+
+        # convert to records and make Spark DF
+        records = pandas_df.to_dict(orient="records")
         logger.info("Converting pandas DataFrame to Spark DataFrame.")
-        spark_df = spark.createDataFrame(pandas_df)
+        spark_df = spark.createDataFrame(records, schema=schema)
+
+        # attach metadata
+        spark_df = spark_df.withColumn("_metadata", struct(lit(actual_path).alias("file_path")))
 
         logger.info(f"Successfully created Spark DataFrame from {abfss_path}")
         return spark_df
 
     except Exception as e:
         logger.error(f"An error occurred while processing {abfss_path}: {e}", exc_info=True)
-        # Depending on requirements, you might want to raise the exception,
-        # return an empty DataFrame, or return None.
         return None
+

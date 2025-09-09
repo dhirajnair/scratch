@@ -40,6 +40,7 @@ import threading          # For thread identification in logs
 import functools          # For lru_cache
 import io
 from pyspark.sql import SparkSession  # For distributed processing
+from pyspark.sql import functions as F
 from azure.storage.blob import BlobServiceClient
 
 # =============================================================================
@@ -61,17 +62,22 @@ BATCH_SIZE = 500                               # Number of files to process in e
 MAX_WORKERS = 16                               # Maximum number of parallel worker threads
 
 # File Filter Configuration
-FILE_KEYWORD = "SustainabilityAndClimateOverview"    # Keyword that must be in filename (lowercase)
+FILE_KEYWORD = "sustainabilityandclimateoverview"    # Keyword that must be in filename (lowercase)
 SUPPORTED_EXTENSIONS = [".xls", ".xlsx"]       # Supported Excel file extensions
+
+# Data Processing Limits (to avoid command result size limits)
+MAX_RECORDS_PER_FILE = 1000000  # Maximum records to process per file (increased from 50k)
+ENABLE_DATA_SAMPLING = False   # Disable data sampling to keep all data
+SAMPLE_SIZE = 10000          # Sample size for large datasets (not used when sampling disabled)
 
 # =============================================================================
 # END CONFIGURATION SECTION
 # =============================================================================
 
-# Configure logging
+# Configure logging - MINIMAL OUTPUT
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s'
+    level=logging.WARNING,  # Only show warnings and errors
+    format='%(levelname)s: %(message)s'  # Simplified format
 )
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,17 @@ CSV_OUTPUT_FILE = f"{OUTPUT_DIR}/unified_climate_esg_data.csv"
 # Initialize Spark Session for distributed processing
 spark = SparkSession.builder.appName("S&P_Climate_Processor").getOrCreate()
 
+# Optimize Spark configuration for better parallelization
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "64MB")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionNum", "1")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", "400")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
+spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "256MB")
+
 # Always use Azure Blob Storage for temporary files (works on all cluster types)
 TEMP_DIR = f"{OUTPUT_DIR}/temp"
 TEMP_LOCATION = "azure"
@@ -99,29 +116,18 @@ CLUSTER_TYPE = "Universal (Azure Blob Temp)"
 # Ensure temp directory exists in Azure
 dbutils.fs.mkdirs(TEMP_DIR)
 
-# Log configuration on startup
-logger.info("=== S&P Global Climate Processor Configuration ===")
-logger.info(f"Cluster Type: {CLUSTER_TYPE}")
-logger.info(f"Temporary Directory: {TEMP_DIR} ({TEMP_LOCATION})")
-logger.info(f"Storage Account: {STORAGE_ACCOUNT_NAME}")
-logger.info(f"Container: {CONTAINER_NAME}")
-logger.info(f"Input Directory: {INPUT_DIR}")
-logger.info(f"Output Directory: {OUTPUT_DIR}")
-logger.info(f"Max Retries: {MAX_RETRIES}")
-logger.info(f"Batch Size: {BATCH_SIZE}")
-logger.info(f"File Keyword Filter: {FILE_KEYWORD}")
-logger.info("=" * 50)
+# Minimal startup logging
+print("S&P Climate Processor: Starting...")
+print(f"Processing {len(dbutils.fs.ls(INPUT_DIR))} files from {INPUT_DIR}")
 
 # Verify Azure temp directory is accessible
-logger.info(f"Testing Azure temp directory access: {TEMP_DIR}")
 try:
     test_file = f"{TEMP_DIR}/startup_test_{int(time.time())}.txt"
     dbutils.fs.put(test_file, "test", True)
     dbutils.fs.rm(test_file)
-    logger.info(f"✓ Azure temp directory {TEMP_DIR} is accessible")
+    print("✓ Azure temp directory accessible")
 except Exception as e:
-    logger.error(f"✗ Azure temp directory {TEMP_DIR} is NOT accessible: {e}")
-    logger.error("This will cause file processing errors!")
+    print(f"✗ Azure temp directory error: {e}")
 
 # =============================================================================
 # EXCEL READING FUNCTIONS (FROM SP_BUSINESS.PY)
@@ -236,12 +242,10 @@ def extract_and_process_file(input_file):
     - input_file: Path to the input S&P Global Excel file
     
     Returns:
-    - (success, file_path, data_list) tuple
+    - (success, file_path, data_df, error_msg) tuple
     """
     # Get a unique thread ID for temp file naming
     thread_id = threading.get_ident()
-    
-    logger.info(f"Thread {thread_id}: Processing file: {input_file}")
     
     try:
         # Read Excel file using the new method
@@ -266,23 +270,23 @@ def extract_and_process_file(input_file):
         
         # Extract data points
         data_entries = extract_data_entries(rows, sections, thread_id)
-        logger.info(f"Thread {thread_id}: Extracted {len(data_entries)} data entries from {input_file}")
         
         # Create a new dataframe with the structured data
         df_result = create_structured_dataframe(company_name, company_key, description, data_entries)
+        
+        # Apply data sampling if enabled and dataset is large
+        if ENABLE_DATA_SAMPLING and len(df_result) > MAX_RECORDS_PER_FILE:
+            df_result = df_result.sample(n=min(SAMPLE_SIZE, len(df_result)), random_state=42)
         
         # Add metadata columns directly to the dataframe
         df_result['source_file'] = input_file
         df_result['processed_timestamp'] = datetime.datetime.now().isoformat()
         
         # Return success and the data
-        return (True, input_file, df_result)
+        return (True, input_file, df_result, None)
             
     except Exception as e:
-        logger.error(f"Thread {thread_id}: Error processing file {input_file}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return (False, input_file, str(e))
+        return (False, input_file, None, str(e))
 
 def extract_company_info(rows, input_file=None, thread_id=None):
     log_prefix = f"Thread {thread_id}: " if thread_id else ""
@@ -416,45 +420,40 @@ def create_structured_dataframe(company_name, company_key, description, data_ent
 # CONSOLIDATION AND CSV GENERATION FUNCTIONS
 # =============================================================================
 
-def consolidate_climate_data(df):
+def create_csv_friendly_consolidation(df):
     """
-    Consolidates climate data by nesting metrics into structured arrays,
-    replicating the logic from the provided SQL query.
+    Create a CSV-friendly consolidated view - one row per company per risk type
+    with flattened metrics as separate columns.
     """
-    logger.info("Grouping by category to collect metrics...")
-    category_metrics_df = df.groupBy(
-        "company_name", "key", "description", "risk_type", "category"
+    logger.info("Creating CSV-friendly consolidation...")
+    
+    consolidated_df = df.groupBy(
+        "company_name", "key", "description", "risk_type"
     ).agg(
         F.first("source_file").alias("source_file"),
         F.first("processed_timestamp").alias("processed_timestamp"),
-        F.collect_list(
-            F.struct(
-                F.col("question"), F.col("response"),
-                F.col("industry_comparison"), F.col("industry_average")
-            )
-        ).alias("metrics")
-    )
-
-    logger.info("Grouping by risk_type to collect categories...")
-    consolidated_df = category_metrics_df.groupBy(
-        "company_name", "key", "description", "risk_type"
-    ).agg(
-        F.collect_list(
-            F.struct(F.col("category"), F.col("metrics"))
-        ).alias("risk_metrics"),
-        F.max("source_file").alias("source_file"),
-        F.max("processed_timestamp").alias("processed_timestamp")
-    )
-
-    logger.info("Ordering final data...")
-    ordered_df = consolidated_df.orderBy(
+        # Count metrics per category (flattened)
+        F.count(F.when(F.col("category") == "Biodiversity", 1)).alias("biodiversity_metrics_count"),
+        F.count(F.when(F.col("category") == "Energy", 1)).alias("energy_metrics_count"),
+        F.count(F.when(F.col("category") == "Climate", 1)).alias("climate_metrics_count"),
+        F.count(F.when(F.col("category") == "Human Capital", 1)).alias("human_capital_metrics_count"),
+        F.count(F.when(F.col("category") == "Employee Health", 1)).alias("employee_health_metrics_count"),
+        F.count(F.when(F.col("category") == "Human Rights", 1)).alias("human_rights_metrics_count"),
+        F.count(F.when(F.col("category") == "Ethics", 1)).alias("ethics_metrics_count"),
+        F.count(F.when(F.col("category") == "Corporate Governance", 1)).alias("corporate_governance_metrics_count"),
+        F.count(F.when(F.col("category") == "Risk & Crisis", 1)).alias("risk_crisis_metrics_count"),
+        F.count(F.when(F.col("category") == "Employment Practices", 1)).alias("employment_practices_metrics_count"),
+        # Total metrics count
+        F.count("*").alias("total_metrics_count")
+    ).orderBy(
         "company_name",
         F.when(F.col("risk_type") == "Environmental", 1)
          .when(F.col("risk_type") == "Social", 2)
          .when(F.col("risk_type") == "Governance", 3)
          .otherwise(4)
     )
-    return ordered_df
+    
+    return consolidated_df
 
 
 def sanitize_column_name(col_name):
@@ -478,143 +477,84 @@ def sanitize_column_name(col_name):
 
 def create_unified_csv_files(climate_data, output_file_path):
     """
-    Create a unified CSV file with comprehensive climate data.
-    Also creates separate CSV files for individual data types.
+    Create CSV files using Spark's native capabilities for better performance.
     """
     try:
-        # Convert Spark DataFrame to pandas for CSV generation
-        if climate_data:
-            climate_df = climate_data.toPandas()
-        else:
-            climate_df = pd.DataFrame()
+        if not climate_data or climate_data.count() == 0:
+            print("No data to write to CSV")
+            return False, "No data available"
         
-        # Get safe paths for CSV file creation (always use Azure temp)
-        timestamp = int(time.time())
-        local_csv_path = f"/Workspace/tmp/unified_climate_esg_data_{timestamp}.csv"
-        azure_temp_path = f"{TEMP_DIR}/unified_climate_esg_data_{timestamp}.csv"
-        os.makedirs("/Workspace/tmp", exist_ok=True)
+        # Limit records if dataset is too large
+        if climate_data.count() > MAX_RECORDS_PER_FILE:
+            print(f"Large dataset detected ({climate_data.count()} records). Truncating to {MAX_RECORDS_PER_FILE} records.")
+            climate_data = climate_data.limit(MAX_RECORDS_PER_FILE)
         
-        # === CREATE MAIN UNIFIED CSV FILE ===
-        if not climate_df.empty:
-            # Create comprehensive unified records
-            unified_data = []
-            for _, row in climate_df.iterrows():
-                company_key = row.get('key', '')
-                
-                # Create detailed risk metrics information
-                risk_metrics = row.get('risk_metrics', [])
-                environmental_metrics = []
-                social_metrics = []
-                governance_metrics = []
-                
-                for risk_metric in risk_metrics:
-                    category = risk_metric.get('category', '')
-                    metrics = risk_metric.get('metrics', [])
-                    
-                    if row.get('risk_type') == 'Environmental':
-                        environmental_metrics.extend([{
-                            'category': category,
-                            'metrics': metrics
-                        }])
-                    elif row.get('risk_type') == 'Social':
-                        social_metrics.extend([{
-                            'category': category,
-                            'metrics': metrics
-                        }])
-                    elif row.get('risk_type') == 'Governance':
-                        governance_metrics.extend([{
-                            'category': category,
-                            'metrics': metrics
-                        }])
-                
-                # Create summary strings for each risk type
-                env_categories = '; '.join([m['category'] for m in environmental_metrics if m['category']])
-                env_questions = '; '.join([q['question'] for m in environmental_metrics for q in m['metrics'] if q.get('question')])
-                env_responses = '; '.join([str(q['response']) for m in environmental_metrics for q in m['metrics'] if q.get('response')])
-                
-                social_categories = '; '.join([m['category'] for m in social_metrics if m['category']])
-                social_questions = '; '.join([q['question'] for m in social_metrics for q in m['metrics'] if q.get('question')])
-                social_responses = '; '.join([str(q['response']) for m in social_metrics for q in m['metrics'] if q.get('response')])
-                
-                gov_categories = '; '.join([m['category'] for m in governance_metrics if m['category']])
-                gov_questions = '; '.join([q['question'] for m in governance_metrics for q in m['metrics'] if q.get('question')])
-                gov_responses = '; '.join([str(q['response']) for m in governance_metrics for q in m['metrics'] if q.get('response')])
-                
-                unified_record = {
-                    # Company Details
-                    'Company_Name': row.get('company_name', ''),
-                    'Company_Key': company_key,
-                    'Description': row.get('description', ''),
-                    'Source_File': row.get('source_file', ''),
-                    'Processed_Timestamp': row.get('processed_timestamp', ''),
-                    
-                    # Environmental Summary
-                    'Environmental_Categories': env_categories,
-                    'Environmental_Questions': env_questions,
-                    'Environmental_Responses': env_responses,
-                    'Environmental_Metric_Count': len(environmental_metrics),
-                    
-                    # Social Summary
-                    'Social_Categories': social_categories,
-                    'Social_Questions': social_questions,
-                    'Social_Responses': social_responses,
-                    'Social_Metric_Count': len(social_metrics),
-                    
-                    # Governance Summary
-                    'Governance_Categories': gov_categories,
-                    'Governance_Questions': gov_questions,
-                    'Governance_Responses': gov_responses,
-                    'Governance_Metric_Count': len(governance_metrics),
-                    
-                    # Overall Summary
-                    'Total_Risk_Types': len(set([row.get('risk_type', '')])),
-                    'Total_Categories': len(environmental_metrics) + len(social_metrics) + len(governance_metrics)
-                }
-                unified_data.append(unified_record)
-            
-            # Create main CSV file
-            if unified_data:
-                unified_df = pd.DataFrame(unified_data)
-                unified_df.to_csv(local_csv_path, index=False)
-                logger.info(f"Created unified CSV with {len(unified_df)} company records")
-        
-        # Copy main file to final output location via Azure temp
-        dbutils.fs.cp(f"file:{local_csv_path}", azure_temp_path)
-        dbutils.fs.cp(azure_temp_path, output_file_path)
-        # Clean up both local and Azure temp
-        os.remove(local_csv_path)
-        dbutils.fs.rm(azure_temp_path)
-        
-        logger.info(f"Successfully created main unified CSV file: {output_file_path}")
-        
-        # === CREATE SEPARATE CSV FILES FOR INDIVIDUAL DATA TYPES ===
+        # Generate timestamped filenames
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_path = output_file_path.rsplit('/', 1)[0]
-        timestamp = output_file_path.split('_')[-1].replace('.csv', '')
         
-        def create_and_copy_csv(df, file_prefix, output_path):
-            """Helper function to create CSV files via Azure temp"""
-            local_path = f"/Workspace/tmp/{file_prefix}_{int(time.time())}.csv"
-            azure_temp_path = f"{TEMP_DIR}/{file_prefix}_{int(time.time())}.csv"
-            
-            df.to_csv(local_path, index=False)
-            
-            dbutils.fs.cp(f"file:{local_path}", azure_temp_path)
-            dbutils.fs.cp(azure_temp_path, output_path)
-            os.remove(local_path)
-            dbutils.fs.rm(azure_temp_path)
+        # 1. Create CONSOLIDATED CSV (Company-RiskType level - flattened for CSV)
+        consolidated_df = create_csv_friendly_consolidation(climate_data)
+        consolidated_count = consolidated_df.count()
+        consolidated_headers = consolidated_df.columns
         
-        # Create separate Climate Data CSV
-        if not climate_df.empty:
-            climate_output_path = f"{base_path}/climate_data_{timestamp}.csv"
-            create_and_copy_csv(climate_df, 'climate_data', climate_output_path)
-            logger.info(f"Created separate Climate Data CSV: {climate_output_path}")
+        print(f"📊 CONSOLIDATED CSV Stats:")
+        print(f"   Rows: {consolidated_count:,}")
+        print(f"   Columns: {len(consolidated_headers)}")
+        print(f"   Headers: {consolidated_headers}")
         
-        return True, output_file_path
+        consolidated_csv_path = f"{base_path}/consolidated_climate_esg_data_{timestamp}.csv"
+        temp_consolidated_dir = f"{consolidated_csv_path}_temp"
+        consolidated_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(temp_consolidated_dir)
+        
+        # Find the part file and rename it to the final CSV
+        part_files = dbutils.fs.ls(temp_consolidated_dir)
+        for part_file in part_files:
+            if part_file.name.startswith("part-") and part_file.name.endswith(".csv"):
+                dbutils.fs.cp(part_file.path, consolidated_csv_path)
+                break
+        
+        # Clean up temp directory
+        dbutils.fs.rm(temp_consolidated_dir, True)
+        print(f"✓ Created consolidated CSV: {consolidated_csv_path}")
+        
+        # 2. Create CLIMATE CSV (flattened data - one row per question/response)
+        climate_count = climate_data.count()
+        climate_headers = climate_data.columns
+        
+        print(f"📊 CLIMATE CSV Stats:")
+        print(f"   Rows: {climate_count:,}")
+        print(f"   Columns: {len(climate_headers)}")
+        print(f"   Headers: {climate_headers}")
+        
+        climate_csv_path = f"{base_path}/climate_data_{timestamp}.csv"
+        temp_climate_dir = f"{climate_csv_path}_temp"
+        climate_data.coalesce(1).write.mode("overwrite").option("header", "true").csv(temp_climate_dir)
+        
+        # Find the part file and rename it to the final CSV
+        part_files = dbutils.fs.ls(temp_climate_dir)
+        for part_file in part_files:
+            if part_file.name.startswith("part-") and part_file.name.endswith(".csv"):
+                dbutils.fs.cp(part_file.path, climate_csv_path)
+                break
+        
+        # Clean up temp directory
+        dbutils.fs.rm(temp_climate_dir, True)
+        print(f"✓ Created climate data CSV: {climate_csv_path}")
+        
+        # Summary comparison
+        reduction_percentage = ((climate_count - consolidated_count) / climate_count * 100) if climate_count > 0 else 0
+        print(f"\n📈 CONSOLIDATION SUMMARY:")
+        print(f"   Original data: {climate_count:,} rows")
+        print(f"   Consolidated: {consolidated_count:,} rows")
+        print(f"   Reduction: {reduction_percentage:.1f}%")
+        print(f"   Compression ratio: {climate_count/consolidated_count:.1f}:1")
+        
+        return True, consolidated_csv_path
         
     except Exception as e:
-        error_msg = f"Error creating unified CSV files: {str(e)}"
-        logger.error(error_msg)
-        logger.debug(traceback.format_exc())
+        error_msg = f"Error creating CSV files: {str(e)}"
+        print(f"✗ {error_msg}")
         return False, error_msg
 
 # =============================================================================
@@ -712,26 +652,6 @@ def process_excel_file_wrapper(file_path_arg, error_dir_arg, max_retries_arg):
 # CONSOLIDATION LOGIC
 # =============================================================================
 
-def consolidate_climate_data(df):
-    """
-    Consolidates climate data by nesting metrics into structured arrays,
-    replicating the logic from the provided SQL query.
-    """
-    logger.info("Grouping by category to collect metrics...")
-    category_metrics_df = df.groupBy(
-        "company_name", "key", "description", "risk_type", "category"
-    ).agg(
-        F.first("source_file").alias("source_file"),
-        F.first("processed_timestamp").alias("processed_timestamp"),
-        F.collect_list(
-            F.struct(
-                F.col("question"), F.col("response"),
-                F.col("industry_comparison"), F.col("industry_average")
-            )
-        ).alias("metrics")
-    )
-
-
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
@@ -742,98 +662,11 @@ import concurrent.futures
 import time
 import uuid
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.functions import col, lit
 from pyspark.sql.types import StructType, StructField, StringType
 import datetime
 from collections import defaultdict
-import threading
-import queue
-
-# Initialize Spark session (already available in Databricks)
-spark = SparkSession.builder.appName("S&P ESG Data Processor").getOrCreate()
-
-
-
-def extract_and_process_file(input_file):
-    """
-    Extracts data from an S&P Global Excel file and returns structured data
-    
-    Parameters:
-    - input_file: Path to the input S&P Global Excel file
-    
-    Returns:
-    - (success, file_path, data_list) tuple
-    """
-    # Get a unique thread ID for temp file naming
-    thread_id = threading.get_ident()
-    
-    print(f"Thread {thread_id}: Processing file: {input_file}")
-    
-    try:
-        # Generate a unique temp file name to avoid conflicts
-        temp_file_id = str(uuid.uuid4())[:8]
-        temp_input = f"/tmp/{temp_file_id}_{os.path.basename(input_file)}"
-        
-        # Download file to local filesystem
-        dbutils.fs.cp(input_file, f"file:{temp_input}")
-        
-        # For .xls files, we need to use the 'xlrd' engine
-        if input_file.lower().endswith('.xls'):
-            print(f"Thread {thread_id}: Using xlrd engine for {input_file}")
-            df = pd.read_excel(temp_input, sheet_name=0, engine='xlrd')
-            xl = pd.ExcelFile(temp_input, engine='xlrd')
-        else:
-            print(f"Thread {thread_id}: Using openpyxl engine for {input_file}")
-            df = pd.read_excel(temp_input, sheet_name=0, engine='openpyxl')
-            xl = pd.ExcelFile(temp_input, engine='openpyxl')
-        
-        # Convert DataFrame to rows for processing
-        rows = [df.columns.tolist()] + df.values.tolist()
-        
-        # Extract company information and other data
-        company_info = extract_company_info(rows, input_file, thread_id)
-        company_name = company_info.get('company_name', 'Unknown Company')
-        company_key = company_info.get('company_key', '')
-        
-        # Extract the description text
-        description = extract_description(rows, thread_id)
-        
-        # First, analyze sections and their types
-        sections = identify_all_sections(rows, thread_id)
-        
-        # Extract data points
-        data_entries = extract_data_entries(rows, sections, thread_id)
-        print(f"Thread {thread_id}: Extracted {len(data_entries)} data entries from {input_file}")
-        
-        # Create a new dataframe with the structured data
-        df_result = create_structured_dataframe(company_name, company_key, description, data_entries)
-        
-        # Add metadata columns directly to the dataframe
-        df_result['source_file'] = input_file
-        df_result['processed_timestamp'] = datetime.datetime.now().isoformat()
-        
-        # Clean up temporary file
-        try:
-            os.remove(temp_input)
-        except:
-            pass
-        
-        # Return success and the data
-        return (True, input_file, df_result)
-            
-    except Exception as e:
-        print(f"Thread {thread_id}: Error processing file {input_file}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # Clean up temporary file if it exists
-        try:
-            if 'temp_input' in locals():
-                os.remove(temp_input)
-        except:
-            pass
-            
-        return (False, input_file, str(e))
 
 # Modify extraction functions to include thread_id for better logging
 def extract_company_info(rows, input_file=None, thread_id=None):
@@ -1494,7 +1327,6 @@ def main():
     
     for file_info in file_list_from_dbfs:
         if file_info.isDir(): 
-            logger.debug(f"Skipping directory: {file_info.path}")
             continue
         
         file_path = file_info.path
@@ -1506,63 +1338,146 @@ def main():
         if is_excel and contains_keyword:
             if file_path not in processed_files_set_on_start:
                 files_to_process_this_run.append(file_path)
-            else:
-                logger.info(f"Skipping already processed file (from tracking): {file_name}")
-        else:
-            logger.debug(f"Skipping file (name/ext mismatch or not relevant): {file_path}")
             
     if not files_to_process_this_run:
-        logger.info("No new Excel files matching criteria found to process in this run.")
+        print("No new Excel files found to process.")
         return
     
-    logger.info(f"Found {len(files_to_process_this_run)} new Excel files to process in this run.")
+    print(f"Found {len(files_to_process_this_run)} files to process using distributed Spark.")
     
-    # Get cluster information for distributed processing
+    # Test a single file first to debug issues
+    if files_to_process_this_run:
+        test_file = files_to_process_this_run[0]
+        print(f"Testing first file: {test_file}")
+        try:
+            success, processed_fp, data_df, error_msg = extract_and_process_file(test_file)
+            print(f"Test result - Success: {success}, Error: {error_msg}")
+            if success and data_df is not None:
+                print(f"Test data shape: {data_df.shape}")
+                print(f"Test data columns: {list(data_df.columns)}")
+        except Exception as e:
+            print(f"Test file failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Get cluster info for optimal batch sizing
     try:
-        # Get total cores across the cluster
-        total_cores = int(spark.conf.get("spark.executor.cores", "2")) * int(spark.conf.get("spark.executor.instances", "2"))
-        driver_cores = int(spark.conf.get("spark.driver.cores", "2"))
-        total_cluster_cores = total_cores + driver_cores
-        
-        # Use more parallelism for cluster processing
-        max_workers = min(MAX_WORKERS, max(8, total_cluster_cores * 2)) # More aggressive parallelism
-        
-        logger.info(f"Cluster Info - Driver cores: {driver_cores}, Executor cores: {total_cores}, Total: {total_cluster_cores}")
-        logger.info(f"Using up to {max_workers} worker threads for parallel processing.")
-        
-    except Exception as e:
-        logger.warning(f"Could not get cluster info: {e}. Using default threading.")
-        max_workers = min(MAX_WORKERS, max(1, os.cpu_count() or 4))
+        executor_cores = int(spark.conf.get("spark.executor.cores", "2"))
+        executor_instances = int(spark.conf.get("spark.executor.instances", "2"))
+        total_cores = executor_cores * executor_instances
+        print(f"Cluster: {executor_instances} executors x {executor_cores} cores = {total_cores} total cores")
+    except:
+        total_cores = 4
+        print(f"Using default cluster size: {total_cores} cores")
     
-    # Global data collectors for all processed files
-    all_climate_dataframes = []
+    # Use Spark RDD for distributed processing (like sp_business.py pattern)
+    USE_SPARK_DISTRIBUTION = len(files_to_process_this_run) > 50  # Use Spark for datasets > 50 files
     
-    # Process in batches
-    batch_size = BATCH_SIZE
-    total_batches = (len(files_to_process_this_run) + batch_size - 1) // batch_size
-    
-    total_successful_files = 0
-    total_failed_files = []
-    
-    # Process each batch
-    for batch_idx in range(total_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min((batch_idx + 1) * batch_size, len(files_to_process_this_run))
-        current_batch = files_to_process_this_run[start_idx:end_idx]
+    if USE_SPARK_DISTRIBUTION:
+        print(f"🚀 Large dataset detected ({len(files_to_process_this_run)} files) - using Spark RDD distributed processing")
         
-        logger.info(f"Processing batch {batch_idx+1}/{total_batches}: files {start_idx+1} to {end_idx} ({len(current_batch)} files)")
-        
-        # Process this batch
-        successful_batch_files = 0
-        failed_batch_files = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="S&P_Climate_FileWorker") as executor:
-            future_to_filepath = {
-                executor.submit(process_excel_file_wrapper, fp, ERROR_DIR, MAX_RETRIES): fp
-                for fp in current_batch
-            }
+        def spark_process_file(file_path):
+            """Function to be executed on Spark executors"""
+            import os
+            import time
+            import random
             
-        for future in concurrent.futures.as_completed(future_to_filepath):
+            file_name = file_path.split("/")[-1]
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    if attempt > 0:
+                        wait_time = random.uniform(0.5, 1.5) * (attempt + 1)
+                        time.sleep(wait_time)
+                    
+                    success, processed_fp, data_df, error_msg = extract_and_process_file(file_path)
+                    
+                    if success and data_df is not None:
+                        return (True, file_path, data_df, None)
+                    else:
+                        if attempt == MAX_RETRIES - 1:  # Last attempt
+                            return (False, file_path, None, error_msg)
+                        
+                except Exception as e:
+                    error_message = f"Spark executor exception for {file_name}: {str(e)}"
+                    if attempt == MAX_RETRIES - 1:  # Last attempt
+                        return (False, file_path, None, error_message)
+            
+            return (False, file_path, None, "Max retries exceeded")
+        
+        # Create RDD and process files across cluster with optimal partitioning
+        # Use more aggressive partitioning for better parallelization
+        optimal_partitions = min(max(total_cores * 12, 600), len(files_to_process_this_run) // 20)
+        print(f"Creating RDD with {optimal_partitions} partitions for {len(files_to_process_this_run)} files")
+        print(f"Target: ~{len(files_to_process_this_run) // optimal_partitions} files per partition")
+        
+        files_rdd = spark.sparkContext.parallelize(files_to_process_this_run, numSlices=optimal_partitions)
+        results_rdd = files_rdd.map(spark_process_file)
+        
+        # Cache the RDD for better performance
+        results_rdd.cache()
+        
+        # Force evaluation to trigger Spark job
+        print("Triggering Spark job execution...")
+        partition_count = results_rdd.getNumPartitions()
+        print(f"RDD has {partition_count} partitions")
+        
+        # Collect results with progress tracking (reverted to reliable approach)
+        print("Collecting results from Spark executors...")
+        print(f"Processing {len(files_to_process_this_run)} files across {optimal_partitions} partitions")
+        results = results_rdd.collect()
+        
+        # Process results
+        all_climate_dataframes = []
+        total_successful_files = 0
+        total_failed_files = []
+        
+        for result in results:
+            success, file_path, data_df, error_msg = result
+            
+            if success and data_df is not None:
+                newly_processed_in_this_run.add(file_path)
+                total_successful_files += 1
+                all_climate_dataframes.append(data_df)
+            else:
+                total_failed_files.append((file_path.split('/')[-1], error_msg))
+        
+        print(f"Spark processing complete: {total_successful_files} success, {len(total_failed_files)} failed")
+        
+    else:
+        print(f"📝 Small dataset ({len(files_to_process_this_run)} files) - using multi-threading on driver")
+        
+        # Use optimized threading with cluster-aware worker count
+        max_workers = min(MAX_WORKERS, max(8, total_cores * 4))  # More aggressive parallelism
+        print(f"Processing {len(files_to_process_this_run)} files using {max_workers} workers")
+        
+        # Process files in batches using ThreadPoolExecutor
+        all_climate_dataframes = []
+        total_successful_files = 0
+        total_failed_files = []
+        
+        # Process in smaller batches to avoid memory issues
+        batch_size = min(100, len(files_to_process_this_run) // max_workers + 1)
+        total_batches = (len(files_to_process_this_run) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(files_to_process_this_run))
+            current_batch = files_to_process_this_run[start_idx:end_idx]
+            
+            print(f"Processing batch {batch_idx+1}/{total_batches} ({len(current_batch)} files)")
+            
+            # Process this batch
+            successful_batch_files = 0
+            failed_batch_files = []
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="S&P_Climate_FileWorker") as executor:
+                future_to_filepath = {
+                    executor.submit(process_excel_file_wrapper, fp, ERROR_DIR, MAX_RETRIES): fp
+                    for fp in current_batch
+                }
+                
+            for future in concurrent.futures.as_completed(future_to_filepath):
                 original_filepath = future_to_filepath[future]
                 original_filename = original_filepath.split('/')[-1]
                 try:
@@ -1572,139 +1487,72 @@ def main():
                         newly_processed_in_this_run.add(processed_fp)
                         successful_batch_files += 1
                         all_climate_dataframes.append(returned_data_df)
-                        logger.info(f"Successfully processed: {original_filename} ({successful_batch_files}/{len(current_batch)} completed)")
-                else:
-                    # Handle error case
+                    else:
+                        # Handle error case
                         failed_batch_files.append((original_filename, error_msg))
-                        logger.error(f"Failed to process: {original_filename} - Error: {error_msg}")
                 except Exception as exc:
-                    logger.error(f"File {original_filename} generated an unexpected exception in main processing loop: {exc}")
-                    logger.debug(traceback.format_exc())
                     failed_batch_files.append((original_filename, str(exc)))
                     try: 
                         dbutils.fs.cp(original_filepath, f"{ERROR_DIR}/{original_filename}", recurse=False)
-                        logger.info(f"Copied file {original_filename} (due to main loop exception) to {ERROR_DIR}")
                     except Exception as copy_exc:
-                        logger.error(f"Could not copy {original_filename} to error dir after main loop exception: {copy_exc}")
+                        pass
+            
+            # Update totals
+            total_successful_files += successful_batch_files
+            total_failed_files.extend(failed_batch_files)
+            
+            print(f"Batch {batch_idx+1} complete: {successful_batch_files} success, {len(failed_batch_files)} failed")
         
-        # Log batch processing completion
-        logger.info(f"BATCH {batch_idx+1} completed: {successful_batch_files} files processed successfully")
-        
-        # Update totals
-        total_successful_files += successful_batch_files
-        total_failed_files.extend(failed_batch_files)
-        
-        logger.info(f"Completed batch {batch_idx+1}/{total_batches}: {successful_batch_files} success, {len(failed_batch_files)} failures")
+        print(f"Threading processing complete: {total_successful_files} success, {len(total_failed_files)} failed")
     
-    # Generate unified CSV file after all batches are processed
+    # Generate unified CSV file after all processing
     if all_climate_dataframes:
-        logger.info("=== Generating Unified CSV File ===")
-        logger.info(f"Total data collected - Climate DataFrames: {len(all_climate_dataframes)}")
+        print("Generating CSV files...")
         
         # Combine all pandas DataFrames into one
         combined_pandas_df = pd.concat(all_climate_dataframes, ignore_index=True)
         raw_spark_df = spark.createDataFrame(combined_pandas_df)
 
-        # Consolidate the data using Spark
-        logger.info("Starting Spark consolidation...")
-        consolidated_df = consolidate_climate_data(raw_spark_df)
-
         # Generate timestamped CSV filename
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_output_path = f"{OUTPUT_DIR}/unified_climate_esg_data_{timestamp}.csv"
+        csv_output_path = f"{OUTPUT_DIR}/consolidated_climate_esg_data_{timestamp}.csv"
         
+        # Write consolidated data to CSV
         success, result = create_unified_csv_files(
-            consolidated_df, 
+            raw_spark_df, 
             csv_output_path
         )
         
+        
         if success:
-            logger.info(f"✓ Successfully generated main unified CSV file: {csv_output_path}")
-            logger.info(f"✓ Also created separate CSV files for individual data types")
-            logger.info(f"CSV files contain data from {total_successful_files} processed files")
+            print(f"✓ CSV files created: {csv_output_path}")
         else:
-            logger.error(f"✗ Failed to generate CSV files: {result}")
-    else:
-        logger.warning("No data available for CSV generation")
+            print(f"✗ Failed to generate CSV files: {result}")
     
-    # Update tracking file with all successfully processed files
+    # Update tracking file
     if newly_processed_in_this_run:
         final_processed_set = processed_files_set_on_start.union(newly_processed_in_this_run)
-        logger.info(f"Updating tracking file. Total unique processed files: {len(final_processed_set)}")
         tracking_content = "# S&P Global Climate processed files\n# Format: absolute_path_to_file\n"
         for f_path in sorted(list(final_processed_set)): 
             tracking_content += f"{f_path}\n"
         try:
             dbutils.fs.put(tracking_file, tracking_content, True)
-            logger.info(f"Successfully updated tracking file: {tracking_file}")
-    except Exception as e:
-            logger.error(f"CRITICAL: Error updating tracking file {tracking_file} at the end: {str(e)}")
+        except Exception as e:
+            print(f"Error updating tracking file: {e}")
 
-    # Calculate final file counts
-    total_files_found = len(files_to_process_this_run)
-    total_files_previously_processed = len(processed_files_set_on_start)
-    total_files_newly_processed = len(newly_processed_in_this_run)
-    total_files_now_processed = len(processed_files_set_on_start.union(newly_processed_in_this_run))
-    
-    # Final comprehensive summary
-    logger.info("=" * 80)
-    logger.info("                    FINAL PROCESSING SUMMARY")
-    logger.info("=" * 80)
-    
-    # File Processing Statistics
-    logger.info("📊 FILE PROCESSING STATISTICS:")
-    logger.info(f"   • Total files found in this run: {total_files_found}")
-    logger.info(f"   • Files already processed (skipped): {total_files_previously_processed}")
-    logger.info(f"   • Files newly processed in this run: {total_files_newly_processed}")
-    logger.info(f"   • Files successfully processed: {total_successful_files}")
-    logger.info(f"   • Files failed in this run: {len(total_failed_files)}")
-    logger.info(f"   • Total files ever processed: {total_files_now_processed}")
-    
-    # Data Extraction Statistics
+    print(f"Successfully updated tracking file: {tracking_file}")
+    #except Exception as e:
+        #p#rint(f"Error updating tracking file: {e}")
+
+    # Final summary
+    print(f"\n=== PROCESSING COMPLETE ===")
+    print(f"Files processed: {total_successful_files}")
+    print(f"Files failed: {len(total_failed_files)}")
     if all_climate_dataframes:
-        logger.info("")
-        logger.info("📈 DATA EXTRACTION STATISTICS:")
-        logger.info(f"   • Climate DataFrames processed: {len(all_climate_dataframes):,}")
-        logger.info(f"   • Total data records processed: {sum(len(df) for df in all_climate_dataframes):,}")
-    
-    # Configuration Summary
-    logger.info("")
-    logger.info("⚙️  CONFIGURATION USED:")
-    logger.info(f"   • Storage Account: {STORAGE_ACCOUNT_NAME}")
-    logger.info(f"   • Container: {CONTAINER_NAME}")
-    logger.info(f"   • Input Path: {INPUT_DIR}")
-    logger.info(f"   • Output Path: {OUTPUT_DIR}")
-    logger.info(f"   • Batch Size: {BATCH_SIZE}")
-    logger.info(f"   • Max Workers: {max_workers}")
-    
-    # Failed Files Details
-    if total_failed_files:
-        logger.info("")
-        logger.info("❌ FAILED FILES DETAILS:")
-        for f_name, err_msg in total_failed_files:
-            logger.info(f"   • {f_name}: {err_msg}")
-    
-    # CSV Output Summary
-    if all_climate_dataframes:
-        logger.info("")
-        logger.info("📁 CSV OUTPUT FILES GENERATED:")
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        logger.info(f"   • Main unified file: unified_climate_esg_data_{timestamp}.csv")
-        logger.info(f"   • Climate data: climate_data_{timestamp}.csv")
-        logger.info(f"   • All files saved to: {OUTPUT_DIR}")
-    
-    # Success/Failure Status
-    logger.info("")
-    if total_successful_files > 0:
-        logger.info("✅ PROCESSING COMPLETED SUCCESSFULLY!")
-        if len(total_failed_files) > 0:
-            logger.info(f"⚠️  Note: {len(total_failed_files)} files failed - check error directory")
-    else:
-        logger.info("❌ NO FILES WERE SUCCESSFULLY PROCESSED")
-    
-    logger.info("=" * 80)
-    logger.info("                    END OF EXECUTION")
-    logger.info("=" * 80)
+        total_records = sum(len(df) for df in all_climate_dataframes)
+        print(f"Total records: {total_records:,}")
+        print(f"CSV files created in: {OUTPUT_DIR}")
+    print("=" * 30)
 
 
 if __name__ == "__main__":
