@@ -1,0 +1,1 @@
+gs://intelligence-data-lake-dev/raw/sc-snp/sc-customers/20250910/*.parquet
