@@ -133,7 +133,7 @@ def _validate_excel_file(stream, file_name):
         logger.error(f"❌ Error validating file: {e}")
         return False
 
-def _read_excel_file(file_path: str, file_name: str):
+def _read_excel_file_v0(file_path: str, file_name: str):
     """Read Excel file using Azure Blob Storage client and pandas (fallback method)"""
     try:
         # Extract blob info from abfss path
@@ -204,6 +204,265 @@ def _read_excel_file(file_path: str, file_name: str):
         logger.error(f"❌ Error reading Excel file {file_path}: {e}")
         logger.error(f"🔍 Full error details: {traceback.format_exc()}")
         return None
+
+def _read_excel_file(file_path: str, file_name: str):
+    """Read Excel file with special handling for legacy formats including pyexcel"""
+    try:
+        # Extract blob info from abfss path
+        match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', file_path)
+        if not match:
+            logger.error(f"❌ Invalid abfss path format: {file_path}")
+            return None
+        
+        container_name, account_name, blob_path = match.groups()
+        
+        # Get connection string
+        connection_string = CONNECTION_STRING
+        if not connection_string:
+            logger.error("❌ Azure connection string not found in config")
+            return None
+        
+        # Connect to blob storage
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+        
+        # Download file to memory
+        stream = BytesIO()
+        blob_data = blob_client.download_blob().readall()
+        stream.write(blob_data)
+        stream.seek(0)
+        
+        # Determine the file extension
+        file_extension = os.path.splitext(file_name)[1].lower()
+        
+        # For .xls files, we need to save to disk first for some legacy formats
+        if file_extension == '.xls':
+            # Save to a temporary file
+            temp_file = f"/tmp/{uuid.uuid4()}_{file_name}"
+            
+            try:
+                with open(temp_file, 'wb') as f:
+                    f.write(blob_data)
+                
+                # Method 1: Try with xlrd first (for standard .xls files)
+                try:
+                    pandas_df = pd.read_excel(temp_file, sheet_name=0, engine='xlrd')
+                    logger.info(f"✅ Successfully read .xls file with xlrd: {file_name}, shape: {pandas_df.shape}")
+                    return pandas_df
+                except IndexError:
+                    logger.debug(f"xlrd IndexError for {file_name}, trying alternative methods...")
+                except Exception as e:
+                    logger.debug(f"xlrd failed: {str(e)[:100]}")
+                
+                # Method 2: Try with pyexcel (excellent for legacy formats)
+                if PYEXCEL_AVAILABLE:
+                    try:
+                        # Read with pyexcel
+                        book = pe.get_book(file_name=temp_file)
+                        
+                        # Get the first sheet
+                        sheet_names = book.sheet_names()
+                        if sheet_names:
+                            sheet = book[sheet_names[0]]
+                            
+                            # Convert to records (list of lists)
+                            records = sheet.to_array()
+                            
+                            if records and len(records) > 0:
+                                # Create DataFrame
+                                if len(records) > 1:
+                                    # Use first row as headers
+                                    pandas_df = pd.DataFrame(records[1:], columns=records[0])
+                                else:
+                                    # Single row, no headers
+                                    pandas_df = pd.DataFrame(records)
+                                
+                                logger.info(f"✅ Successfully read .xls file with pyexcel: {file_name}, shape: {pandas_df.shape}")
+                                return pandas_df
+                    except Exception as e:
+                        logger.debug(f"pyexcel failed: {str(e)[:100]}")
+                    
+                    # Method 2b: Try pyexcel with different options
+                    try:
+                        # Try to read as records directly
+                        records = pe.get_records(file_name=temp_file)
+                        if records:
+                            pandas_df = pd.DataFrame(records)
+                            logger.info(f"✅ Successfully read .xls file with pyexcel get_records: {file_name}, shape: {pandas_df.shape}")
+                            return pandas_df
+                    except Exception as e:
+                        logger.debug(f"pyexcel get_records failed: {str(e)[:100]}")
+                    
+                    # Method 2c: Try converting to xlsx first with pyexcel
+                    try:
+                        temp_xlsx = f"/tmp/{uuid.uuid4()}.xlsx"
+                        pe.save_book_as(file_name=temp_file, dest_file_name=temp_xlsx)
+                        
+                        # Now read the xlsx file
+                        pandas_df = pd.read_excel(temp_xlsx, sheet_name=0, engine='openpyxl')
+                        logger.info(f"✅ Successfully read .xls file via pyexcel xlsx conversion: {file_name}, shape: {pandas_df.shape}")
+                        
+                        # Clean up temp xlsx
+                        if os.path.exists(temp_xlsx):
+                            os.remove(temp_xlsx)
+                        
+                        return pandas_df
+                    except Exception as e:
+                        logger.debug(f"pyexcel xlsx conversion failed: {str(e)[:100]}")
+                        if os.path.exists(temp_xlsx):
+                            try:
+                                os.remove(temp_xlsx)
+                            except:
+                                pass
+                
+                # Method 3: Try reading without specifying engine (let pandas choose)
+                try:
+                    pandas_df = pd.read_excel(temp_file, sheet_name=0)
+                    logger.info(f"✅ Successfully read .xls file with pandas auto-engine: {file_name}, shape: {pandas_df.shape}")
+                    return pandas_df
+                except Exception as e:
+                    logger.debug(f"Pandas auto-engine failed: {str(e)[:100]}")
+                
+                # Method 4: Try with openpyxl (sometimes works with certain .xls formats)
+                try:
+                    pandas_df = pd.read_excel(temp_file, sheet_name=0, engine='openpyxl')
+                    logger.info(f"✅ Successfully read .xls file with openpyxl: {file_name}, shape: {pandas_df.shape}")
+                    return pandas_df
+                except Exception as e:
+                    logger.debug(f"openpyxl failed: {str(e)[:100]}")
+                
+                # Method 5: Try reading as HTML table (some old Excel files are actually HTML)
+                try:
+                    # Read file content as text
+                    with open(temp_file, 'rb') as f:
+                        content = f.read()
+                    
+                    # Check if it might be HTML
+                    if b'<html' in content.lower() or b'<table' in content.lower():
+                        df_list = pd.read_html(temp_file)
+                        if df_list and len(df_list) > 0:
+                            pandas_df = df_list[0]
+                            logger.info(f"✅ Successfully read .xls file as HTML table: {file_name}, shape: {pandas_df.shape}")
+                            return pandas_df
+                except Exception as e:
+                    logger.debug(f"HTML reading failed: {str(e)[:100]}")
+                
+                # Method 6: Try reading as CSV (some .xls files are actually CSV)
+                try:
+                    pandas_df = pd.read_csv(temp_file, encoding='utf-8')
+                    if len(pandas_df.columns) > 1:  # Ensure it's not a single column
+                        logger.info(f"✅ Successfully read .xls file as CSV: {file_name}, shape: {pandas_df.shape}")
+                        return pandas_df
+                except Exception as e:
+                    logger.debug(f"CSV reading failed: {str(e)[:100]}")
+                
+                # Method 7: Use older xlrd version compatibility mode
+                try:
+                    # Try with formatting_info=False which works with some older formats
+                    import xlrd
+                    workbook = xlrd.open_workbook(temp_file, formatting_info=False, on_demand=True)
+                    sheet = workbook.sheet_by_index(0)
+                    
+                    # Extract data manually
+                    data = []
+                    for row_idx in range(sheet.nrows):
+                        row_data = []
+                        for col_idx in range(sheet.ncols):
+                            try:
+                                cell_value = sheet.cell_value(row_idx, col_idx)
+                                row_data.append(cell_value)
+                            except:
+                                row_data.append('')
+                        data.append(row_data)
+                    
+                    if data and len(data) > 1:
+                        # Create DataFrame from extracted data
+                        pandas_df = pd.DataFrame(data[1:], columns=data[0])
+                        logger.info(f"✅ Successfully read .xls file with xlrd manual extraction: {file_name}, shape: {pandas_df.shape}")
+                        return pandas_df
+                except Exception as e:
+                    logger.debug(f"xlrd manual extraction failed: {str(e)[:100]}")
+                
+                # If all methods fail
+                logger.error(f"❌ Unable to read .xls file {file_name} - all methods failed")
+                logger.error(f"   File appears to be in an unsupported legacy format")
+                logger.error(f"   Consider converting the file to .xlsx format")
+                
+                # Log which methods were tried
+                methods_tried = ["xlrd", "pandas auto", "openpyxl", "HTML", "CSV", "xlrd manual"]
+                if PYEXCEL_AVAILABLE:
+                    methods_tried.insert(1, "pyexcel")
+                logger.error(f"   Methods tried: {', '.join(methods_tried)}")
+                
+                return None
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+        
+        elif file_extension == '.xlsx':
+            # For .xlsx files, try multiple approaches
+            
+            # Method 1: Standard openpyxl
+            try:
+                pandas_df = pd.read_excel(stream, sheet_name=0, engine='openpyxl')
+                logger.info(f"✅ Successfully read .xlsx file: {file_name}, shape: {pandas_df.shape}")
+                return pandas_df
+            except Exception as e:
+                logger.debug(f"openpyxl failed for xlsx: {str(e)[:100]}")
+            
+            # Method 2: Try with pyexcel if available
+            if PYEXCEL_AVAILABLE:
+                try:
+                    # Save to temp file for pyexcel
+                    temp_file = f"/tmp/{uuid.uuid4()}_{file_name}"
+                    with open(temp_file, 'wb') as f:
+                        f.write(blob_data)
+                    
+                    book = pe.get_book(file_name=temp_file)
+                    sheet_names = book.sheet_names()
+                    if sheet_names:
+                        sheet = book[sheet_names[0]]
+                        records = sheet.to_array()
+                        if records and len(records) > 1:
+                            pandas_df = pd.DataFrame(records[1:], columns=records[0])
+                            logger.info(f"✅ Successfully read .xlsx file with pyexcel: {file_name}, shape: {pandas_df.shape}")
+                            return pandas_df
+                    
+                    # Clean up
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                        
+                except Exception as e:
+                    logger.debug(f"pyexcel failed for xlsx: {str(e)[:100]}")
+                    if os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
+            
+            logger.error(f"❌ Failed to read .xlsx file {file_name}")
+            return None
+            
+        else:
+            # Unknown extension - try multiple approaches
+            try:
+                pandas_df = pd.read_excel(stream, sheet_name=0)
+                logger.info(f"✅ Successfully read file: {file_name}, shape: {pandas_df.shape}")
+                return pandas_df
+            except Exception as e:
+                logger.error(f"❌ Failed to read file {file_name}: {e}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"❌ Error accessing Excel file {file_path}: {e}")
+        logger.error(f"🔍 Full error details: {traceback.format_exc()}")
+        return None
+
 
 # Extract company name from filename
 def extract_company_name(filename):
@@ -290,6 +549,7 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
         for sheet_name in excel_data.sheet_names:
             
             # Read the sheet without headers using the stream
+            stream.seek(0)
             df_raw = pd.read_excel(stream, sheet_name=sheet_name, header=None)
             
             # Find rows that contain section markers
@@ -338,7 +598,8 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                     try:
                         # Calculate number of rows to read
                         nrows = next_section_row - header_row - 1 if next_section_row < float('inf') else None
-                        
+
+                        stream.seek(0)
                         df_section = pd.read_excel(stream, sheet_name=sheet_name, header=header_row, nrows=nrows)
                         
                         # Clean the dataframe
@@ -391,6 +652,7 @@ def extract_data_with_pandas(file_path, file_type, company_name, debug=False):
                 # Try different header rows
                 for header_row in range(0, 30):
                     try:
+                        stream.seek(0)
                         df = pd.read_excel(stream, sheet_name=sheet_name, header=header_row)
                         
                         # Check if this looks like a data table
@@ -630,6 +892,45 @@ def process_single_file(file_path, output_directory, debug=False):
             "traceback": error_traceback
         })
 
+def read_processed_files(processed_files_path):
+    """Read all previously processed files, handling large files"""
+    previously_processed = set()
+    
+    try:
+        # Method 1: Try reading the full file using dbutils.fs.cp to temp location
+        temp_path = f"/tmp/processed_files_{uuid.uuid4()}.txt"
+        dbutils.fs.cp(processed_files_path, f"file:{temp_path}")
+        
+        with open(temp_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    previously_processed.add(line)
+        
+        # Clean up temp file
+        os.remove(temp_path)
+        
+        logger.info(f"Found {len(previously_processed)} previously processed files")
+        
+    except Exception as e:
+        logger.info(f"Error reading processed_files.txt: {e}")
+        # Fallback: Try reading chunks using Azure Blob Storage
+        try:
+            match = re.match(r'abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)', processed_files_path)
+            if match:
+                container_name, account_name, blob_path = match.groups()
+                blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+                blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
+                
+                blob_data = blob_client.download_blob().readall()
+                content = blob_data.decode('utf-8')
+                previously_processed = set(line.strip() for line in content.split('\n') if line.strip())
+                logger.info(f"Found {len(previously_processed)} previously processed files using blob storage")
+        except Exception as blob_error:
+            logger.error(f"Failed to read processed files: {blob_error}")
+    
+    return previously_processed
+
 # Main processing function
 def process_excel_files():
     # Create timestamp for this processing run
@@ -690,12 +991,13 @@ def process_excel_files():
     
     try:
         # Read the processed_files.txt if it exists
-        processed_content = dbutils.fs.head(processed_files_path, 1000000)  # Read up to 1MB
-        if processed_content:
-            previously_processed = set(processed_content.decode('utf-8').strip().split('\n'))
-            previously_processed.discard('')  # Remove empty lines
-            logger.info(f"Found {len(previously_processed)} previously processed files")
+
+        previously_processed = read_processed_files(processed_files_path)
+
     except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.info(f"Error reading processed_files.txt: {e}")
+        logger.info(f"Error traceback: {error_traceback}")
         logger.info("No processed_files.txt found, will process all files")
     
     # Filter out previously processed files
@@ -808,11 +1110,11 @@ def process_excel_files():
         lines = csv_content.split('\n')[:3]
         logger.info(f"CSV format verification - First 3 lines: {lines}")
         
-        # Write directly to DBFS
-        output_path = f"{OUTPUT_DIR}/customers.csv"
+        # Write directly to DBFS with timestamp
+        output_path = f"{OUTPUT_DIR}/customers_{timestamp}.csv"
         dbutils.fs.put(output_path, csv_content, overwrite=True)
         
-        logger.info(f"Saved {len(all_customer_data)} customer records to {OUTPUT_DIR}/customers.csv")
+        logger.info(f"Saved {len(all_customer_data)} customer records to {OUTPUT_DIR}/customers_{timestamp}.csv")
 
     # Write supplier data to CSV
     if all_supplier_data:
@@ -841,11 +1143,11 @@ def process_excel_files():
         lines = csv_content.split('\n')[:3]
         logger.info(f"CSV format verification - First 3 lines: {lines}")
         
-        # Write directly to DBFS
-        output_path = f"{OUTPUT_DIR}/suppliers.csv"
+        # Write directly to DBFS with timestamp
+        output_path = f"{OUTPUT_DIR}/suppliers_{timestamp}.csv"
         dbutils.fs.put(output_path, csv_content, overwrite=True)
         
-        logger.info(f"Saved {len(all_supplier_data)} supplier records to {OUTPUT_DIR}/suppliers.csv")    
+        logger.info(f"Saved {len(all_supplier_data)} supplier records to {OUTPUT_DIR}/suppliers_{timestamp}.csv")    
     
     # Generate processing summary and logs
     summary_log = f"{LOG_DIR}/processing_summary_{timestamp}.txt"
