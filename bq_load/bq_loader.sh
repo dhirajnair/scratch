@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 #
-# load_parquet_typed.sh - Load all-string Parquet files with proper typing
+# load_parquet_typed.sh - Load Parquet files and transform to proper types
+#
+# Process:
+# 1. ALWAYS drops existing final and staging tables (prevents schema conflicts)
+# 2. Loads Parquet to staging with autodetect (handles INT96 timestamps)
+# 3. Transforms to final table using SAFE_CAST (works with any source type)
+# 4. Uses CREATE OR REPLACE as additional safety net
+#
+# Key features:
+# - No failures from existing tables or schema mismatches
+# - Handles INT96 timestamps in Parquet (legacy format)
+# - Works with YYYYMMDD date formats (20250331 → 2025-03-31)
+# - No PARSE_TIMESTAMP (which fails on non-STRING columns)
+# - Clean slate approach ensures reliability
+#
+# Environment Variables:
+#   KEEP_STAGING=true  - Keep staging tables after processing (default: false)
 #
 set -euo pipefail
 
@@ -12,11 +28,10 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 # Configuration
-INPUT_FILE="${INPUT_FILE:-bq_source.txt}"
+INPUT_FILE="${INPUT_FILE:-boaredex_input.txt}"
 BQ_PROJECT="${BQ_PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 BQ_DATASET="${BQ_DATASET:-cq_source}"
 BQ_LOCATION="${BQ_LOCATION:-US}"
-SCHEMA_DIR="${SCHEMA_DIR:-schemas}"
 STAGING_DATASET="${STAGING_DATASET:-${BQ_DATASET}_staging}"
 KEEP_STAGING="${KEEP_STAGING:-false}"
 
@@ -38,37 +53,17 @@ warn() { log "WARN" "$@"; }
 error() { log "ERROR" "$@"; }
 die() { error "$@"; exit 1; }
 
-# Table name inference
-infer_table_name() {
-  local gcp_path="$1"
-  local path_only="${gcp_path#gs://}"
-  path_only="${path_only#*/}"
+# Table name inference from schema file path
+infer_table_name_from_schema() {
+  local schema_path="$1"
 
-  if [[ "$path_only" =~ ^(.*)/\*\.[^/]+$ ]]; then
-    path_only="${BASH_REMATCH[1]}"
-  elif [[ "$path_only" =~ ^(.*)/[^/]+\.[^/]+$ ]]; then
-    path_only="${BASH_REMATCH[1]}"
-  fi
+  # Extract filename from GCS path
+  local filename=$(basename "$schema_path")
 
-  IFS='/' read -ra PATH_PARTS <<< "$path_only"
+  # Remove .json extension
+  local table_name="${filename%.json}"
 
-  local table_name=""
-  for i in "${!PATH_PARTS[@]}"; do
-    if [[ "${PATH_PARTS[$i]}" =~ ^[0-9]{8}$ ]]; then
-      if [ $i -gt 0 ]; then
-        table_name="${PATH_PARTS[$((i-1))]}"
-        break
-      fi
-    fi
-  done
-
-  if [ -z "$table_name" ]; then
-    local num_parts=${#PATH_PARTS[@]}
-    if [ $num_parts -gt 0 ]; then
-      table_name="${PATH_PARTS[$((num_parts-1))]}"
-    fi
-  fi
-
+  # Clean up the table name (lowercase, replace invalid chars with underscore)
   table_name=$(echo "$table_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
 
   if [ -z "$table_name" ]; then
@@ -78,7 +73,24 @@ infer_table_name() {
   echo "$table_name"
 }
 
-# Generate SQL transformation
+# Download schema from GCS
+download_schema() {
+  local gcs_schema_path="$1"
+  local local_schema_path="$2"
+
+  info "  Downloading schema from: $gcs_schema_path"
+
+  if ! gsutil cp "$gcs_schema_path" "$local_schema_path" </dev/null 2>&1 | tee -a "$LOG_FILE"; then
+    error "  Failed to download schema"
+    return 1
+  fi
+
+  return 0
+}
+
+# Generate SQL transformation - Uses SAFE_CAST for all conversions
+# SAFE_CAST works with any source type (STRING, TIMESTAMP, INT96, etc.)
+# No need for PARSE_TIMESTAMP which only works on STRINGs
 generate_sql() {
   local schema_file="$1"
   local staging_table="$2"
@@ -89,6 +101,10 @@ generate_sql() {
 import json
 import sys
 
+# This script generates SQL that uses SAFE_CAST for all type conversions.
+# SAFE_CAST works with any source column type (STRING, TIMESTAMP, INT96, etc.)
+# This avoids issues with PARSE_TIMESTAMP which only works on STRING columns.
+
 schema_file = sys.argv[1]
 staging_table = sys.argv[2]
 final_table = sys.argv[3]
@@ -96,60 +112,73 @@ final_table = sys.argv[3]
 with open(schema_file, 'r') as f:
     schema = json.load(f)
 
+# We drop the table before this, but use CREATE OR REPLACE as a safety net
 print(f"CREATE OR REPLACE TABLE `{final_table}` AS")
 print("SELECT")
 
 for i, field in enumerate(schema):
     col_name = field['name']
-    bq_type = field['type']
+    bq_type = field['type'].upper()
+
+    # SIMPLIFIED: Use SAFE_CAST for everything - it works whether source is STRING or already typed
 
     if bq_type in ['INTEGER', 'INT64']:
-        cast_expr = f"""  CASE
-    WHEN {col_name} IS NULL OR {col_name} = 'NULL' OR {col_name} = '' THEN NULL
-    ELSE SAFE_CAST(REGEXP_REPLACE({col_name}, r'[^0-9-]', '') AS INT64)
-  END AS {col_name}"""
+        # For integers, clean up potential non-numeric characters
+        cast_expr = f"""  SAFE_CAST(
+    CASE
+      WHEN {col_name} IS NULL THEN NULL
+      WHEN CAST({col_name} AS STRING) IN ('NULL', '') THEN NULL
+      ELSE REGEXP_REPLACE(CAST({col_name} AS STRING), r'[^0-9-]', '')
+    END AS INT64
+  ) AS {col_name}"""
 
     elif bq_type in ['FLOAT', 'FLOAT64']:
-        cast_expr = f"""  CASE
-    WHEN {col_name} IS NULL OR {col_name} = 'NULL' OR {col_name} = '' THEN NULL
-    ELSE SAFE_CAST(REGEXP_REPLACE({col_name}, r'[^0-9.-]', '') AS FLOAT64)
-  END AS {col_name}"""
+        # For floats, clean up potential non-numeric characters
+        cast_expr = f"""  SAFE_CAST(
+    CASE
+      WHEN {col_name} IS NULL THEN NULL
+      WHEN CAST({col_name} AS STRING) IN ('NULL', '') THEN NULL
+      ELSE REGEXP_REPLACE(CAST({col_name} AS STRING), r'[^0-9.-]', '')
+    END AS FLOAT64
+  ) AS {col_name}"""
 
-    elif bq_type == 'BOOLEAN':
+    elif bq_type in ['BOOLEAN', 'BOOL']:
+        # For booleans, handle various representations
         cast_expr = f"""  CASE
-    WHEN UPPER({col_name}) IN ('TRUE', 'T', 'YES', 'Y', '1') THEN TRUE
-    WHEN UPPER({col_name}) IN ('FALSE', 'F', 'NO', 'N', '0') THEN FALSE
+    WHEN {col_name} IS NULL THEN NULL
+    WHEN UPPER(CAST({col_name} AS STRING)) IN ('TRUE', 'T', 'YES', 'Y', '1') THEN TRUE
+    WHEN UPPER(CAST({col_name} AS STRING)) IN ('FALSE', 'F', 'NO', 'N', '0') THEN FALSE
     ELSE NULL
   END AS {col_name}"""
 
     elif bq_type == 'TIMESTAMP':
-        cast_expr = f"""  COALESCE(
-    SAFE.PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%E*S', {col_name}),
-    SAFE.PARSE_TIMESTAMP('%Y/%m/%d %H:%M:%S', {col_name}),
-    SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', {col_name})
-  ) AS {col_name}"""
+        # SIMPLE SAFE_CAST - NO PARSE_TIMESTAMP!
+        cast_expr = f"  SAFE_CAST({col_name} AS TIMESTAMP) AS {col_name}"
 
     elif bq_type == 'DATE':
+        # Handle various date formats including YYYYMMDD
         cast_expr = f"""  CASE
-    WHEN {col_name} IS NULL OR {col_name} = 'NULL' OR {col_name} = '' THEN NULL
-    WHEN REGEXP_CONTAINS({col_name}, r'^[0-9]{{4}}\\.?0?$') THEN
-      SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REGEXP_EXTRACT({col_name}, r'^([0-9]{{4}})'), '-01-01'))
-    WHEN REGEXP_CONTAINS({col_name}, r'^[0-9]{{8}}$') THEN
-      SAFE.PARSE_DATE('%Y%m%d', {col_name})
-    ELSE COALESCE(
-      SAFE.PARSE_DATE('%Y-%m-%d', {col_name}),
-      SAFE.PARSE_DATE('%Y/%m/%d', {col_name}),
-      SAFE.PARSE_DATE('%m/%d/%Y', {col_name}),
-      SAFE.PARSE_DATE('%d/%m/%Y', {col_name})
-    )
+    WHEN {col_name} IS NULL THEN NULL
+    WHEN CAST({col_name} AS STRING) IN ('NULL', '') THEN NULL
+    -- Handle YYYYMMDD format (8 digits)
+    WHEN REGEXP_CONTAINS(CAST({col_name} AS STRING), r'^[0-9]{{8}}$') THEN
+      SAFE.PARSE_DATE('%Y%m%d', CAST({col_name} AS STRING))
+    -- Handle YYYY-MM-DD and other standard formats
+    ELSE SAFE_CAST({col_name} AS DATE)
+  END AS {col_name}"""
+
+    elif bq_type == 'STRING':
+        # For strings, just handle NULL literal
+        cast_expr = f"""  CASE
+    WHEN CAST({col_name} AS STRING) = 'NULL' THEN NULL
+    ELSE CAST({col_name} AS STRING)
   END AS {col_name}"""
 
     else:
-        cast_expr = f"""  CASE
-    WHEN {col_name} = 'NULL' THEN NULL
-    ELSE {col_name}
-  END AS {col_name}"""
+        # For any other type, just use SAFE_CAST
+        cast_expr = f"  SAFE_CAST({col_name} AS {bq_type}) AS {col_name}"
 
+    # Add comma if not last field
     if i < len(schema) - 1:
         cast_expr += ","
 
@@ -158,52 +187,83 @@ for i, field in enumerate(schema):
 print(f"FROM `{staging_table}`")
 PYTHON_SCRIPT
 
-  python3 "$WORK_DIR/generate_sql.py" "$schema_file" "$staging_table" "$final_table" > "$sql_file"
+  python3 "$WORK_DIR/generate_sql.py" "$schema_file" "$staging_table" "$final_table" > "$sql_file" 2>>"$LOG_FILE"
 }
 
-# Process a single path
-process_path() {
+# Process a single path with schema
+process_path_with_schema() {
   local gcp_path="$1"
-  local table_name=$(infer_table_name "$gcp_path")
+  local gcs_schema_path="$2"
+
+  # Infer table name from schema file name
+  local table_name=$(infer_table_name_from_schema "$gcs_schema_path")
 
   info "Processing: $gcp_path"
+  info "  Schema: $gcs_schema_path"
   info "  Table name: $table_name"
+
+  # Download schema to local temp directory
+  local local_schema_file="$WORK_DIR/${table_name}_schema.json"
+  if ! download_schema "$gcs_schema_path" "$local_schema_file"; then
+    error "  Failed to download schema from GCS"
+    return 1
+  fi
 
   local staging_table="${table_name}_staging"
   local staging_table_ref="${BQ_PROJECT}:${STAGING_DATASET}.${staging_table}"
   local final_table_ref="${BQ_PROJECT}:${BQ_DATASET}.${table_name}"
-  local schema_file="${SCHEMA_DIR}/${table_name}.json"
 
-  if [ ! -f "$schema_file" ]; then
-    warn "  Schema file not found: $schema_file"
-    return 1
-  fi
+  # Step 0: Drop existing tables to ensure clean slate (prevents all conflicts)
+  info "  Ensuring clean slate - dropping any existing tables..."
+
+  # Drop final table/view if exists (rm -f handles both and won't error if not exists)
+  info "  Dropping final table/view (if exists): $final_table_ref"
+  bq --quiet --project_id="$BQ_PROJECT" rm -f "$final_table_ref" </dev/null 2>/dev/null || true
+
+  # Drop staging table if exists
+  info "  Dropping staging table (if exists): $staging_table_ref"
+  bq --quiet --project_id="$BQ_PROJECT" rm -f "$staging_table_ref" </dev/null 2>/dev/null || true
+
+  info "  ✓ Clean slate ensured - no existing tables"
 
   # Step 1: Load to staging
+  # Always use autodetect since our SAFE_CAST SQL handles any column type
   info "  Loading to staging: $staging_table_ref"
+  info "  Using autodetect to preserve Parquet native types (INT96 timestamps, etc.)"
+
   if ! bq --quiet --project_id="$BQ_PROJECT" load \
     --source_format=PARQUET \
     --autodetect \
     --replace \
     "${staging_table_ref}" \
-    "$gcp_path" 2>&1 | tee -a "$LOG_FILE"; then
+    "$gcp_path" </dev/null 2>&1 | tee -a "$LOG_FILE"; then
     error "  Failed to load to staging"
     return 1
   fi
 
+  info "  Successfully loaded to staging with autodetect"
+
   # Step 2: Generate and execute SQL
   info "  Generating transformation SQL..."
   local sql_file="$WORK_DIR/${table_name}.sql"
-  generate_sql "$schema_file" \
+
+  if ! generate_sql "$local_schema_file" \
     "${BQ_PROJECT}.${STAGING_DATASET}.${staging_table}" \
     "${BQ_PROJECT}.${BQ_DATASET}.${table_name}" \
-    "$sql_file"
+    "$sql_file"; then
+    error "  Failed to generate SQL"
+    return 1
+  fi
 
-  info "  Executing transformation..."
+  info "  Executing transformation (CREATE OR REPLACE)..."
   if ! bq --quiet --project_id="$BQ_PROJECT" query \
     --use_legacy_sql=false \
     --format=none < "$sql_file" 2>&1 | tee -a "$LOG_FILE"; then
     error "  Transformation failed"
+    error "  Check the generated SQL at: $sql_file"
+    # Save SQL for debugging even after cleanup
+    cp "$sql_file" "/tmp/${table_name}_failed.sql" 2>/dev/null || true
+    error "  SQL saved to: /tmp/${table_name}_failed.sql"
     return 1
   fi
 
@@ -211,67 +271,141 @@ process_path() {
   local row_count=$(bq --project_id="$BQ_PROJECT" query \
     --use_legacy_sql=false \
     --format=csv \
-    "SELECT COUNT(*) FROM \`${BQ_PROJECT}.${BQ_DATASET}.${table_name}\`" 2>/dev/null | tail -1)
-  info "  Loaded $row_count rows"
+    "SELECT COUNT(*) FROM \`${BQ_PROJECT}.${BQ_DATASET}.${table_name}\`" </dev/null 2>/dev/null | tail -1)
+  info "  ✓ Success! Loaded $row_count rows to final table: $table_name"
 
-  # Step 4: Clean up staging (optional)
-  if [ "$KEEP_STAGING" != "true" ]; then
-    info "  Cleaning up staging table..."
-    bq --quiet --project_id="$BQ_PROJECT" rm -f "$staging_table_ref" 2>/dev/null || true
+  # Step 4: Clean up staging (optional - only matters if KEEP_STAGING=true)
+  if [ "$KEEP_STAGING" = "true" ]; then
+    info "  Keeping staging table for debugging: $staging_table_ref"
   else
-    info "  Keeping staging table: $staging_table_ref"
+    # With clean slate approach, staging will be dropped at next run anyway
+    # But let's clean it up to save space
+    bq --quiet --project_id="$BQ_PROJECT" rm -f "$staging_table_ref" </dev/null 2>/dev/null || true
+    info "  Staging table cleaned up"
   fi
 
+  # Clean up local schema file
+  rm -f "$local_schema_file"
+
+  # Success!
+  info "  ✓ Table processing complete: ${table_name}"
+  info ""
   return 0
 }
 
-# Main
+# Main - FIXED WITH ARRAY-BASED READING
 main() {
-  info "===== Parquet Typed Loader Started ====="
+  info "=========================================="
+  info "     Parquet Typed Loader v2.0"
+  info "=========================================="
   info "Configuration:"
-  info "  Project: $BQ_PROJECT"
-  info "  Dataset: $BQ_DATASET"
-  info "  Staging: $STAGING_DATASET"
-  info "  Schema Dir: $SCHEMA_DIR"
+  info "  Project:      $BQ_PROJECT"
+  info "  Final Dataset: $BQ_DATASET"
+  info "  Staging:      $STAGING_DATASET"
+  info "  Input File:   $INPUT_FILE"
   info "  Keep Staging: $KEEP_STAGING"
+  info "  Strategy:     Drop & Recreate (no conflicts)"
+  info "  Log File:     $LOG_FILE"
+  info "=========================================="
 
   # Validate
   command -v bq >/dev/null 2>&1 || die "bq CLI not found"
+  command -v gsutil >/dev/null 2>&1 || die "gsutil CLI not found"
   [ -n "$BQ_PROJECT" ] || die "BQ_PROJECT not set"
   [ -f "$INPUT_FILE" ] || die "Input file not found: $INPUT_FILE"
-  [ -d "$SCHEMA_DIR" ] || die "Schema directory not found: $SCHEMA_DIR"
 
-  # Create datasets
+  # Create datasets (ignore if already exists)
   for dataset in "$BQ_DATASET" "$STAGING_DATASET"; do
-    if ! bq --quiet --project_id="$BQ_PROJECT" show --dataset "$dataset" >/dev/null 2>&1; then
+    if ! bq --quiet --project_id="$BQ_PROJECT" show --dataset "$dataset" </dev/null >/dev/null 2>&1; then
       info "Creating dataset: $dataset"
-      bq --quiet --project_id="$BQ_PROJECT" mk \
+      if ! bq --quiet --project_id="$BQ_PROJECT" mk \
         --dataset --location="$BQ_LOCATION" \
-        "${BQ_PROJECT}:${dataset}" || die "Failed to create dataset"
+        "${BQ_PROJECT}:${dataset}" </dev/null >/dev/null 2>&1; then
+        # Check if error is because dataset already exists
+        if bq --quiet --project_id="$BQ_PROJECT" show --dataset "$dataset" </dev/null >/dev/null 2>&1; then
+          info "  Dataset already exists: $dataset"
+        else
+          die "Failed to create dataset: $dataset"
+        fi
+      fi
+    else
+      info "Dataset exists: $dataset"
     fi
   done
 
-  # Process paths
-  SUCCESS=0
-  FAILED=0
+  # Read all valid lines into an array
+  declare -a VALID_LINES=()
 
   while IFS= read -r line; do
+    # Skip comments and empty lines
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     [[ -z "${line// }" ]] && continue
 
+    # Trim whitespace
     line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
+    # Add to array if not empty
     if [ -n "$line" ]; then
-      if process_path "$line"; then
-        ((SUCCESS++))
-      else
-        ((FAILED++))
-      fi
+      VALID_LINES+=("$line")
     fi
   done < "$INPUT_FILE"
 
-  info "===== Complete ====="
-  info "Success: $SUCCESS, Failed: $FAILED"
+  # Get total count
+  TOTAL="${#VALID_LINES[@]}"
+
+  info "Found $TOTAL tables to process"
+  info ""
+
+  # Process entries from array
+  SUCCESS=0
+  FAILED=0
+
+  for ((idx=0; idx<${#VALID_LINES[@]}; idx++)); do
+    line="${VALID_LINES[$idx]}"
+    CURRENT=$((idx + 1))
+
+    info "========== Processing table $CURRENT of $TOTAL =========="
+
+    # Parse comma-separated values
+    IFS=',' read -r gcp_path gcs_schema_path <<< "$line"
+
+    # Trim whitespace from each field
+    gcp_path=$(echo "$gcp_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    gcs_schema_path=$(echo "$gcs_schema_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    if [ -z "$gcp_path" ] || [ -z "$gcs_schema_path" ]; then
+      warn "Skipping invalid line $CURRENT (line content: '$line')"
+      warn "  Expected format: gcp_path,gcs_schema_path"
+      warn "  Got: gcp_path='$gcp_path', gcs_schema_path='$gcs_schema_path'"
+      ((FAILED++)) || true
+      continue
+    fi
+
+    if process_path_with_schema "$gcp_path" "$gcs_schema_path" </dev/null; then
+      ((SUCCESS++)) || true
+      info "✓ Completed table $CURRENT of $TOTAL"
+    else
+      ((FAILED++)) || true
+      error "✗ Failed table $CURRENT of $TOTAL"
+    fi
+
+    info ""
+  done
+
+  # Clean up work directory (keep if there were failures for debugging)
+  if [ "$FAILED" -eq 0 ]; then
+    rm -rf "$WORK_DIR"
+    info "Cleaned up temporary files"
+  else
+    info "Keeping work directory for debugging: $WORK_DIR"
+  fi
+
+  info "===== Processing Complete ====="
+  info "✓ Success: $SUCCESS tables"
+  if [ "$FAILED" -gt 0 ]; then
+    error "✗ Failed: $FAILED tables (check logs for details)"
+  fi
+  info "Dataset: ${BQ_PROJECT}:${BQ_DATASET}"
 
   [ "$FAILED" -eq 0 ] || exit 1
 }
