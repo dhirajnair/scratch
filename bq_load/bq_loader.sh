@@ -89,13 +89,21 @@ download_schema() {
 }
 
 # Generate SQL transformation - Uses SAFE_CAST for all conversions
-# SAFE_CAST works with any source type (STRING, TIMESTAMP, INT96, etc.)
-# No need for PARSE_TIMESTAMP which only works on STRINGs
+# SAFE_CAST works with any source column type (STRING, TIMESTAMP, INT96, etc.)
+# No need for PARSE_TIMESTAMP which only works on STRING columns.
 generate_sql() {
   local schema_file="$1"
   local staging_table="$2"
   local final_table="$3"
   local sql_file="$4"
+  local staging_table_ref="$5"
+
+  # First get the staging table schema
+  local staging_schema_file="$WORK_DIR/staging_schema_temp.json"
+  if ! bq --project_id="$BQ_PROJECT" show --schema --format=prettyjson "$staging_table_ref" > "$staging_schema_file" 2>>"$LOG_FILE"; then
+    error "  Failed to get staging table schema"
+    return 1
+  fi
 
   cat > "$WORK_DIR/generate_sql.py" << 'PYTHON_SCRIPT'
 import json
@@ -108,14 +116,43 @@ import sys
 schema_file = sys.argv[1]
 staging_table = sys.argv[2]
 final_table = sys.argv[3]
+staging_schema_file = sys.argv[4]
 
 with open(schema_file, 'r') as f:
     schema = json.load(f)
+
+with open(staging_schema_file, 'r') as f:
+    staging_schema = json.load(f)
+
+# Create sets for comparison
+expected_columns = {field['name'].lower() for field in schema}
+staging_columns = {field['name'].lower(): field for field in staging_schema}
+
+# Find extra columns
+extra_columns = set(staging_columns.keys()) - expected_columns
+
+# Check for non-string extra columns
+extra_non_string = []
+extra_string = []
+for col in extra_columns:
+    col_type = staging_columns[col].get('type', '').upper()
+    if col_type != 'STRING':
+        extra_non_string.append(f"{col}({col_type})")
+    else:
+        extra_string.append(col)
+
+if extra_non_string:
+    print(f"ERROR: Found non-STRING extra columns: {', '.join(extra_non_string)}", file=sys.stderr)
+    sys.exit(1)
+
+if extra_string:
+    print(f"INFO: Including extra STRING columns: {', '.join(sorted(extra_string))}", file=sys.stderr)
 
 # We drop the table before this, but use CREATE OR REPLACE as a safety net
 print(f"CREATE OR REPLACE TABLE `{final_table}` AS")
 print("SELECT")
 
+# Process schema columns
 for i, field in enumerate(schema):
     col_name = field['name']
     bq_type = field['type'].upper()
@@ -178,16 +215,43 @@ for i, field in enumerate(schema):
         # For any other type, just use SAFE_CAST
         cast_expr = f"  SAFE_CAST({col_name} AS {bq_type}) AS {col_name}"
 
-    # Add comma if not last field
-    if i < len(schema) - 1:
+    # Add comma if not last field or there are extra columns
+    if i < len(schema) - 1 or extra_string:
         cast_expr += ","
 
+    print(cast_expr)
+
+# Add extra string columns
+for i, col_name in enumerate(sorted(extra_string)):
+    cast_expr = f"  {col_name}"
+    if i < len(extra_string) - 1:
+        cast_expr += ","
     print(cast_expr)
 
 print(f"FROM `{staging_table}`")
 PYTHON_SCRIPT
 
-  python3 "$WORK_DIR/generate_sql.py" "$schema_file" "$staging_table" "$final_table" > "$sql_file" 2>>"$LOG_FILE"
+  # Run Python script and capture stderr
+  local python_stderr="$WORK_DIR/python_stderr.txt"
+  if python3 "$WORK_DIR/generate_sql.py" "$schema_file" "$staging_table" "$final_table" "$staging_schema_file" > "$sql_file" 2>"$python_stderr"; then
+    # Log any info messages
+    if [ -s "$python_stderr" ]; then
+      grep "^INFO:" "$python_stderr" | sed 's/^INFO: /  /' | while IFS= read -r line; do
+        info "$line"
+      done
+    fi
+    rm -f "$staging_schema_file"
+    return 0
+  else
+    # Show error and fail
+    if [ -s "$python_stderr" ]; then
+      grep "^ERROR:" "$python_stderr" | sed 's/^ERROR: /  /' | while IFS= read -r line; do
+        error "$line"
+      done
+    fi
+    rm -f "$staging_schema_file"
+    return 1
+  fi
 }
 
 # Process a single path with schema
@@ -250,7 +314,8 @@ process_path_with_schema() {
   if ! generate_sql "$local_schema_file" \
     "${BQ_PROJECT}.${STAGING_DATASET}.${staging_table}" \
     "${BQ_PROJECT}.${BQ_DATASET}.${table_name}" \
-    "$sql_file"; then
+    "$sql_file" \
+    "$staging_table_ref"; then
     error "  Failed to generate SQL"
     return 1
   fi
